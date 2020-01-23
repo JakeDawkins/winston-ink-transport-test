@@ -16,27 +16,11 @@ class WinstonInkTransport extends Transport {
         [{level}] {message}
       </Color>
     );
-    waitUntilExit().then(cb);
+    waitUntilExit().then(()=>{
+      cb();
+    });
   }
 }
-
-const logger = winston.createLogger({
-  transports: [
-    new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format((info) => {
-          if (info.path) {
-            info.message = `[${info.path.join(' -> ')}] ${info.message}`;
-          }
-          return info;
-        })(),
-        winston.format.cli()
-      )
-    })
-    // new WinstonInkTransport({})
-  ],
-  exitOnError: false
-});
 
 type TaskBody<T> = (t: Task<T>) => Promise<T>;
 
@@ -58,16 +42,16 @@ class Task<T> {
     private body: TaskBody<T>
   ) {
     if (title === null && parent !== null) {
-      throw Error("Non-root tasks must have a title")
+      throw Error("Non-root tasks must have a title");
     }
     if (title != null && parent == null) {
-      throw Error("Root tasks may not have a title")
+      throw Error("Root tasks may not have a title");
     }
     this.logger = logger.child({
       taskTitle: this.title,
       path: this.path(),
       task: this,
-      rootTask: this.rootTask(),
+      rootTask: this.rootTask()
     });
   }
   get subtasks(): ReadonlyArray<Task<any>> {
@@ -94,7 +78,7 @@ class Task<T> {
   }
 
   async run(): Promise<T> {
-    this.setStatus(TaskStatus.RUNNING)
+    this.setStatus(TaskStatus.RUNNING);
     this.logger.info("starting");
     try {
       return await this.body(this);
@@ -113,22 +97,46 @@ class Task<T> {
     this._subtasks.push(subTask);
     return await subTask.run();
   }
-
 }
 
-async function runTasks<T>(logger: winston.Logger, body: TaskBody<T>): Promise<T> {
+async function runTasks<T>(
+  logger: winston.Logger,
+  body: TaskBody<T>
+): Promise<T> {
   return await new Task(logger, null, null, body).run();
 }
 
 export default class Hello extends Command {
   static flags = {
     name: flags.string({ char: "n", description: "name to print" }),
-    force: flags.boolean({ char: "f" })
+    force: flags.boolean({ char: "f" }),
+    ink: flags.boolean({ char: "i" })
   };
 
   async run() {
     const { flags } = this.parse(Hello);
     const name = flags.name || "world";
+
+    const logger = winston.createLogger({
+      transports: [
+        flags.ink
+          ? new WinstonInkTransport({})
+          : new winston.transports.Console({
+              format: winston.format.combine(
+                winston.format(info => {
+                  if (info.path) {
+                    info.message = `[${info.path.join(" -> ")}] ${
+                      info.message
+                    }`;
+                  }
+                  return info;
+                })(),
+                winston.format.cli()
+              )
+            })
+      ],
+      exitOnError: false
+    });
 
     logger.info(`hello ${name} from ./src/commands/hello.ts`);
 
@@ -141,8 +149,8 @@ export default class Hello extends Command {
       await t.task("second thing", async t => {
         t.logger.info("next things next");
         await t.task("nested under second", async t => {
-          t.logger.info('doing a nested thing');
-        })
+          t.logger.info("doing a nested thing");
+        });
       });
       await Promise.all([
         t.task("parallel 1", async t => {
