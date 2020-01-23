@@ -3,6 +3,7 @@ import winston from "winston";
 import Transport from "winston-transport";
 import React from "react";
 import { render, Color } from "ink";
+import sleep from "sleep-promise";
 
 class WinstonInkTransport extends Transport {
   constructor(opts: any) {
@@ -21,13 +22,103 @@ class WinstonInkTransport extends Transport {
 
 const logger = winston.createLogger({
   transports: [
-    // new winston.transports.Console({
-    //   format: winston.format.json()
-    // }),
-    new WinstonInkTransport({})
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format((info) => {
+          if (info.path) {
+            info.message = `[${info.path.join(' -> ')}] ${info.message}`;
+          }
+          return info;
+        })(),
+        winston.format.cli()
+      )
+    })
+    // new WinstonInkTransport({})
   ],
   exitOnError: false
 });
+
+type TaskBody<T> = (t: Task<T>) => Promise<T>;
+
+enum TaskStatus {
+  PENDING,
+  RUNNING,
+  SUCEEDED,
+  FAILED
+}
+
+class Task<T> {
+  public readonly logger: winston.Logger;
+  private _subtasks: Task<any>[] = [];
+  private _status: TaskStatus = TaskStatus.PENDING;
+  constructor(
+    logger: winston.Logger,
+    public readonly title: string | null,
+    public readonly parent: Task<any> | null,
+    private body: TaskBody<T>
+  ) {
+    if (title === null && parent !== null) {
+      throw Error("Non-root tasks must have a title")
+    }
+    if (title != null && parent == null) {
+      throw Error("Root tasks may not have a title")
+    }
+    this.logger = logger.child({
+      taskTitle: this.title,
+      path: this.path(),
+      task: this,
+      rootTask: this.rootTask(),
+    });
+  }
+  get subtasks(): ReadonlyArray<Task<any>> {
+    return this._subtasks;
+  }
+  get status(): TaskStatus {
+    return this._status;
+  }
+  isRoot() {
+    return this.parent === null;
+  }
+  path(): string[] {
+    if (this.title === null || this.parent === null) {
+      return [];
+    }
+    return [...this.parent.path(), this.title];
+  }
+  rootTask(): Task<any> {
+    return this.parent === null ? this : this.parent.rootTask();
+  }
+
+  private setStatus(status: TaskStatus) {
+    this._status = status;
+  }
+
+  async run(): Promise<T> {
+    this.setStatus(TaskStatus.RUNNING)
+    this.logger.info("starting");
+    try {
+      return await this.body(this);
+    } catch (e) {
+      this.setStatus(TaskStatus.FAILED);
+      throw e;
+    } finally {
+      if (this._status !== TaskStatus.FAILED) {
+        this.setStatus(TaskStatus.SUCEEDED);
+      }
+      this.logger.info("ending");
+    }
+  }
+  async task<U>(subTitle: string, subBody: TaskBody<U>) {
+    const subTask = new Task(this.logger, subTitle, this, subBody);
+    this._subtasks.push(subTask);
+    return await subTask.run();
+  }
+
+}
+
+async function runTasks<T>(logger: winston.Logger, body: TaskBody<T>): Promise<T> {
+  return await new Task(logger, null, null, body).run();
+}
 
 export default class Hello extends Command {
   static flags = {
@@ -42,5 +133,27 @@ export default class Hello extends Command {
     logger.info(`hello ${name} from ./src/commands/hello.ts`);
 
     if (flags.force) logger.warn(`The --force is with you, ${name}.`);
+
+    await runTasks(logger, async t => {
+      await t.task("first thing", async t => {
+        t.logger.info("first things first");
+      });
+      await t.task("second thing", async t => {
+        t.logger.info("next things next");
+        await t.task("nested under second", async t => {
+          t.logger.info('doing a nested thing');
+        })
+      });
+      await Promise.all([
+        t.task("parallel 1", async t => {
+          await sleep(500);
+          t.logger.info("done");
+        }),
+        t.task("parallel 2", async t => {
+          await sleep(500);
+          t.logger.info("done");
+        })
+      ]);
+    });
   }
 }
