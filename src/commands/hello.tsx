@@ -6,7 +6,15 @@ import { render, Color, Box, Text, Instance } from "ink";
 import sleep from "sleep-promise";
 import Spinner from "ink-spinner";
 
-const TaskTree = ({ task }: { task: Task<any> | null }) => {
+const treeLogFormatter = winston.format.printf(info => info.message);
+
+const TaskTree = ({
+  task,
+  logsByTask
+}: {
+  task: Task<any> | null;
+  logsByTask: Map<Task<any>, any[]>;
+}) => {
   if (task == null) {
     return <Box>Initializing...</Box>;
   }
@@ -14,6 +22,8 @@ const TaskTree = ({ task }: { task: Task<any> | null }) => {
   const { title, status, subtasks, rootTask, parent } = task;
   // this is the root task -- it has no name/status that we care about
   const isRoot = !parent;
+
+  const logs = logsByTask.get(task) || [];
 
   return (
     <Box flexDirection="column">
@@ -31,13 +41,28 @@ const TaskTree = ({ task }: { task: Task<any> | null }) => {
         </Box>
       )}
 
+      {logs && logs.length ? (
+        <Box flexDirection="column" marginLeft={2}>
+          {logs.map((log, i) => (
+            // XXX filter out if transform returns falsey
+            <Box key={i}>
+              ✏️ {treeLogFormatter.transform(log)[Symbol.for("message")]}
+            </Box>
+          ))}
+        </Box>
+      ) : null}
+
       {subtasks && subtasks.length ? (
         <Box
           flexDirection="column"
           marginLeft={isRoot ? 0 : 2 /* don't indent top-level tasks*/}
         >
           {subtasks.map(subtask => (
-            <TaskTree task={subtask} key={Math.random()} />
+            <TaskTree
+              task={subtask}
+              key={Math.random()}
+              logsByTask={logsByTask}
+            />
           ))}
         </Box>
       ) : null}
@@ -47,14 +72,24 @@ const TaskTree = ({ task }: { task: Task<any> | null }) => {
 
 class WinstonInkTransport extends Transport {
   private ink: Instance;
+  private logsByTask = new Map<Task<any>, any[]>();
   constructor(opts: any) {
     super(opts);
-    this.ink = render(<TaskTree task={null} />);
+    this.ink = render(<TaskTree task={null} logsByTask={this.logsByTask} />);
   }
 
   log(info: any, cb: any) {
+    if (!info.meta && info.task) {
+      const task = info.task as Task<any>;
+      if (!this.logsByTask.has(task)) {
+        this.logsByTask.set(task, []);
+      }
+      this.logsByTask.get(task)!.push(info);
+    }
     if (info.rootTask) {
-      this.ink.rerender(<TaskTree task={info.rootTask} />);
+      this.ink.rerender(
+        <TaskTree task={info.rootTask} logsByTask={this.logsByTask} />
+      );
     }
     cb();
   }
@@ -73,6 +108,7 @@ enum TaskStatus {
   FAILED
 }
 
+// TODO use an interface so we don't need all the Task<any>?
 class Task<T> {
   public readonly logger: winston.Logger;
   private _subtasks: Task<any>[] = [];
@@ -121,7 +157,7 @@ class Task<T> {
 
   async run(): Promise<T> {
     this.setStatus(TaskStatus.RUNNING);
-    this.logger.info("starting");
+    this.logger.info("starting", { meta: true });
     try {
       return await this.body(this);
     } catch (e) {
@@ -131,7 +167,7 @@ class Task<T> {
       if (this._status !== TaskStatus.FAILED) {
         this.setStatus(TaskStatus.SUCEEDED);
       }
-      this.logger.info("ending");
+      this.logger.info("ending", { meta: true });
     }
   }
   async task<U>(subTitle: string, subBody: TaskBody<U>) {
@@ -197,10 +233,12 @@ export default class Hello extends Command {
       });
       await Promise.all([
         t.task("parallel 1", async t => {
+          t.logger.info("waiting");
           await sleep(1000);
           t.logger.info("done");
         }),
         t.task("parallel 2", async t => {
+          t.logger.info("waiting longer");
           await sleep(3000);
           t.logger.info("done");
         })
