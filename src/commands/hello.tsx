@@ -2,8 +2,39 @@ import { Command, flags } from "@oclif/command";
 import winston from "winston";
 import Transport from "winston-transport";
 import React from "react";
-import { render, Color } from "ink";
+import { render, Color, Box, Text } from "ink";
 import sleep from "sleep-promise";
+// import Spinner from "ink-spinner";
+
+const TaskTree = ({
+  task: { title, status, subtasks }
+}: {
+  task: Task<any>;
+}) => {
+  return (
+    <Box flexDirection="column">
+      <Box>
+        {status === TaskStatus.PENDING && (
+          <Box paddingRight={1} marginBottom={1}>
+            <Color green>~</Color>
+          </Box>
+        )}
+        {status === TaskStatus.SUCEEDED && <Color green>{"✔ "}</Color>}
+        {status === TaskStatus.FAILED && <Color red>{"X "}</Color>}
+
+        {title && <Text>{title}</Text>}
+      </Box>
+
+      {subtasks && subtasks.length && (
+        <Box flexDirection="column" marginLeft={2}>
+          {subtasks.map(subtask => (
+            <TaskTree task={subtask} key={Math.random()} />
+          ))}
+        </Box>
+      )}
+    </Box>
+  );
+};
 
 class WinstonInkTransport extends Transport {
   constructor(opts: any) {
@@ -16,7 +47,7 @@ class WinstonInkTransport extends Transport {
         [{level}] {message}
       </Color>
     );
-    waitUntilExit().then(()=>{
+    waitUntilExit().then(() => {
       cb();
     });
   }
