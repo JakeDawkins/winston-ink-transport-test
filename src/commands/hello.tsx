@@ -37,6 +37,7 @@ const TaskTree = ({
           )}
           {status === TaskStatus.SUCEEDED && <Color green>{"✔ "}</Color>}
           {status === TaskStatus.FAILED && <Color red>{"X "}</Color>}
+          {status === TaskStatus.PENDING && <Color gray>{"… "}</Color>}
           {title && <Text>{title}</Text>}
         </Box>
       )}
@@ -46,7 +47,7 @@ const TaskTree = ({
           {logs.map((log, i) => (
             // XXX filter out if transform returns falsey
             <Box key={i}>
-              ✏️ {treeLogFormatter.transform(log)[Symbol.for("message")]}
+              🗒️  {treeLogFormatter.transform(log)[Symbol.for("message")]}
             </Box>
           ))}
         </Box>
@@ -94,7 +95,7 @@ class WinstonInkTransport extends Transport {
     cb();
   }
 
-  finish() {
+  unmount() {
     this.ink.unmount();
   }
 }
@@ -153,6 +154,7 @@ class Task<T> {
 
   private setStatus(status: TaskStatus) {
     this._status = status;
+    this.logger.info("status change", {meta: true});
   }
 
   async run(): Promise<T> {
@@ -170,10 +172,20 @@ class Task<T> {
       this.logger.info("ending", { meta: true });
     }
   }
+
   async task<U>(subTitle: string, subBody: TaskBody<U>) {
     const subTask = new Task(this.logger, subTitle, this, subBody);
     this._subtasks.push(subTask);
     return await subTask.run();
+  }
+
+  async wait<U>(p: Promise<U>): Promise<U> {
+    this.setStatus(TaskStatus.PENDING);
+    try {
+      return await p;
+    } finally {
+      this.setStatus(TaskStatus.RUNNING);
+    }
   }
 }
 
@@ -195,23 +207,24 @@ export default class Hello extends Command {
     const { flags } = this.parse(Hello);
     const name = flags.name || "world";
 
+    const inkTransport: WinstonInkTransport | null = flags.ink
+      ? new WinstonInkTransport({})
+      : null;
+
     const logger = winston.createLogger({
       transports: [
-        flags.ink
-          ? new WinstonInkTransport({})
-          : new winston.transports.Console({
-              format: winston.format.combine(
-                winston.format(info => {
-                  if (info.path) {
-                    info.message = `[${info.path.join(" -> ")}] ${
-                      info.message
-                    }`;
-                  }
-                  return info;
-                })(),
-                winston.format.cli()
-              )
-            })
+        inkTransport ??
+          new winston.transports.Console({
+            format: winston.format.combine(
+              winston.format(info => {
+                if (info.path) {
+                  info.message = `[${info.path.join(" -> ")}] ${info.message}`;
+                }
+                return info;
+              })(),
+              winston.format.cli()
+            )
+          })
       ],
       exitOnError: false
     });
@@ -220,29 +233,67 @@ export default class Hello extends Command {
 
     if (flags.force) logger.warn(`The --force is with you, ${name}.`);
 
-    await runTasks(logger, async t => {
-      await t.task("first thing", async t => {
-        t.logger.info("first things first");
-      });
-      await t.task("second thing", async t => {
-        t.logger.info("next things next");
-        await t.task("nested under second", async t => {
-          await sleep(5000);
-          t.logger.info("doing a nested thing");
+    try {
+      await runTasks(logger, async t => {
+        await t.task("first thing", async t => {
+          t.logger.info("first things first");
         });
+        await t.task("second thing", async t => {
+          t.logger.info("next things next");
+          await t.task("nested under second", async t => {
+            await sleep(300);
+            t.logger.info("doing a nested thing");
+          });
+        });
+        await t.task("a few things in a row with pending", async t => {
+          const t1 = t.task<number>("calculate a number", async t => {
+            await sleep(2000);
+            const answer = 123;
+            t.logger.info(`Answer is ${answer}`);
+            return answer;
+          });
+          const t2 = t.task<number>("square it", async t => {
+            const t1Result = await t.wait(t1);
+            await sleep(2000);
+            const squared = t1Result * t1Result;
+            t.logger.info(`I got ${squared}`);
+            return squared;
+          });
+          const t3 = t.task("negate it", async t => {
+            const t2Result = await t.wait(t2);
+            await sleep(2000);
+            const negated = -t2Result;
+            t.logger.info(`I got ${negated}`);
+            return negated;
+          });
+          await Promise.all([t1, t2, t3]);
+          t.logger.info(`Final result was ${await t3}`);
+        });
+        await Promise.all([
+          t.task("parallel 1", async t => {
+            t.logger.info("waiting");
+            await sleep(5000);
+            t.logger.info("done");
+          }),
+          t.task("parallel 2", async t => {
+            t.logger.info("waiting less time");
+            await sleep(2000);
+            t.logger.info("done");
+          })
+        ]);
+        await t.task("subtask will fail", async t => {
+          await t.task("this will fail", async t => {
+            t.logger.warn("gonna fail soon");
+            await sleep(500);
+            throw new Error("oh no");
+          });
+        });
+        await t.task("in the end", async t => {});
       });
-      await Promise.all([
-        t.task("parallel 1", async t => {
-          t.logger.info("waiting");
-          await sleep(1000);
-          t.logger.info("done");
-        }),
-        t.task("parallel 2", async t => {
-          t.logger.info("waiting longer");
-          await sleep(3000);
-          t.logger.info("done");
-        })
-      ]);
-    });
+    } finally {
+      if (flags.ink) {
+        inkTransport?.unmount();
+      }
+    }
   }
 }
