@@ -12,14 +12,14 @@ const TaskTree = ({
   task,
   logsByTask
 }: {
-  task: Task<any> | null;
-  logsByTask: Map<Task<any>, any[]>;
+  task: Task<unknown> | null;
+  logsByTask: Map<Task<unknown>, any[]>;
 }) => {
   if (task == null) {
     return <Box>Initializing...</Box>;
   }
 
-  const { title, status, subtasks, rootTask, parent } = task;
+  const { title, status, subtasks, parent } = task;
   // this is the root task -- it has no name/status that we care about
   const isRoot = !parent;
 
@@ -47,7 +47,7 @@ const TaskTree = ({
           {logs.map((log, i) => (
             // XXX filter out if transform returns falsey
             <Box key={i}>
-              🗒️  {treeLogFormatter.transform(log)[Symbol.for("message")]}
+              🗒️ {treeLogFormatter.transform(log)[Symbol.for("message")]}
             </Box>
           ))}
         </Box>
@@ -73,7 +73,7 @@ const TaskTree = ({
 
 class WinstonInkTransport extends Transport {
   private ink: Instance;
-  private logsByTask = new Map<Task<any>, any[]>();
+  private logsByTask = new Map<Task<unknown>, any[]>();
   constructor(opts: any) {
     super(opts);
     this.ink = render(<TaskTree task={null} logsByTask={this.logsByTask} />);
@@ -81,7 +81,7 @@ class WinstonInkTransport extends Transport {
 
   log(info: any, cb: any) {
     if (!info.meta && info.task) {
-      const task = info.task as Task<any>;
+      const task = info.task as Task<unknown>;
       if (!this.logsByTask.has(task)) {
         this.logsByTask.set(task, []);
       }
@@ -109,15 +109,14 @@ enum TaskStatus {
   FAILED
 }
 
-// TODO use an interface so we don't need all the Task<any>?
 class Task<T> {
   public readonly logger: winston.Logger;
-  private _subtasks: Task<any>[] = [];
+  private _subtasks: Task<unknown>[] = [];
   private _status: TaskStatus = TaskStatus.PENDING;
   constructor(
     logger: winston.Logger,
     public readonly title: string | null,
-    public readonly parent: Task<any> | null,
+    public readonly parent: Task<unknown> | null,
     private body: TaskBody<T>
   ) {
     if (title === null && parent !== null) {
@@ -133,7 +132,7 @@ class Task<T> {
       rootTask: this.rootTask()
     });
   }
-  get subtasks(): ReadonlyArray<Task<any>> {
+  get subtasks(): ReadonlyArray<Task<unknown>> {
     return this._subtasks;
   }
   get status(): TaskStatus {
@@ -148,13 +147,13 @@ class Task<T> {
     }
     return [...this.parent.path(), this.title];
   }
-  rootTask(): Task<any> {
+  rootTask(): Task<unknown> {
     return this.parent === null ? this : this.parent.rootTask();
   }
 
   private setStatus(status: TaskStatus) {
     this._status = status;
-    this.logger.info("status change", {meta: true});
+    this.logger.info("status change", { meta: true });
   }
 
   async run(): Promise<T> {
@@ -174,7 +173,7 @@ class Task<T> {
   }
 
   async task<U>(subTitle: string, subBody: TaskBody<U>) {
-    const subTask = new Task(this.logger, subTitle, this, subBody);
+    const subTask = new Task<U>(this.logger, subTitle, this, subBody);
     this._subtasks.push(subTask);
     return await subTask.run();
   }
@@ -245,10 +244,24 @@ export default class Hello extends Command {
             t.logger.info("doing a nested thing");
           });
         });
+
+        await Promise.all([
+          t.task("parallel 1", async t => {
+            t.logger.info("waiting");
+            await sleep(5000);
+            t.logger.info("done");
+          }),
+          t.task("parallel 2", async t => {
+            t.logger.info("waiting less time");
+            await sleep(2000);
+            t.logger.info("done");
+          })
+        ]);
+
         await t.task("a few things in a row with pending", async t => {
           const t1 = t.task<number>("calculate a number", async t => {
             await sleep(2000);
-            const answer = 123;
+            const answer: number = 123;
             t.logger.info(`Answer is ${answer}`);
             return answer;
           });
@@ -269,18 +282,7 @@ export default class Hello extends Command {
           await Promise.all([t1, t2, t3]);
           t.logger.info(`Final result was ${await t3}`);
         });
-        await Promise.all([
-          t.task("parallel 1", async t => {
-            t.logger.info("waiting");
-            await sleep(5000);
-            t.logger.info("done");
-          }),
-          t.task("parallel 2", async t => {
-            t.logger.info("waiting less time");
-            await sleep(2000);
-            t.logger.info("done");
-          })
-        ]);
+
         await t.task("subtask will fail", async t => {
           await t.task("this will fail", async t => {
             t.logger.warn("gonna fail soon");
