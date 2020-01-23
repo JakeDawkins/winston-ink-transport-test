@@ -4,29 +4,38 @@ import Transport from "winston-transport";
 import React from "react";
 import { render, Color, Box, Text, Instance } from "ink";
 import sleep from "sleep-promise";
-// import Spinner from "ink-spinner";
+import Spinner from "ink-spinner";
 
 const TaskTree = ({ task }: { task: Task<any> | null }) => {
   if (task == null) {
-    return <Box>Waiting...</Box>;
+    return <Box>Initializing...</Box>;
   }
-  const { title, status, subtasks } = task;
+
+  const { title, status, subtasks, rootTask, parent } = task;
+  // this is the root task -- it has no name/status that we care about
+  const isRoot = !parent;
+
   return (
     <Box flexDirection="column">
-      <Box>
-        {status === TaskStatus.PENDING && (
-          <Box paddingRight={1} marginBottom={1}>
-            <Color green>~</Color>
-          </Box>
-        )}
-        {status === TaskStatus.SUCEEDED && <Color green>{"✔ "}</Color>}
-        {status === TaskStatus.FAILED && <Color red>{"X "}</Color>}
-
-        {title && <Text>{title}</Text>}
-      </Box>
+      {/* don't render spinner/done/error for root task -- it's unimportant */}
+      {!isRoot && (
+        <Box>
+          {status === TaskStatus.RUNNING && (
+            <Color green>
+              <Spinner type="dots" />{" "}
+            </Color>
+          )}
+          {status === TaskStatus.SUCEEDED && <Color green>{"✔ "}</Color>}
+          {status === TaskStatus.FAILED && <Color red>{"X "}</Color>}
+          {title && <Text>{title}</Text>}
+        </Box>
+      )}
 
       {subtasks && subtasks.length ? (
-        <Box flexDirection="column" marginLeft={2}>
+        <Box
+          flexDirection="column"
+          marginLeft={isRoot ? 0 : 2 /* don't indent top-level tasks*/}
+        >
           {subtasks.map(subtask => (
             <TaskTree task={subtask} key={Math.random()} />
           ))}
