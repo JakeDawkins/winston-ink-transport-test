@@ -2,15 +2,15 @@ import { Command, flags } from "@oclif/command";
 import winston from "winston";
 import Transport from "winston-transport";
 import React from "react";
-import { render, Color, Box, Text } from "ink";
+import { render, Color, Box, Text, Instance } from "ink";
 import sleep from "sleep-promise";
 // import Spinner from "ink-spinner";
 
-const TaskTree = ({
-  task: { title, status, subtasks }
-}: {
-  task: Task<any>;
-}) => {
+const TaskTree = ({ task }: { task: Task<any> | null }) => {
+  if (task == null) {
+    return <Box>Waiting...</Box>;
+  }
+  const { title, status, subtasks } = task;
   return (
     <Box flexDirection="column">
       <Box>
@@ -25,31 +25,33 @@ const TaskTree = ({
         {title && <Text>{title}</Text>}
       </Box>
 
-      {subtasks && subtasks.length && (
+      {subtasks && subtasks.length ? (
         <Box flexDirection="column" marginLeft={2}>
           {subtasks.map(subtask => (
             <TaskTree task={subtask} key={Math.random()} />
           ))}
         </Box>
-      )}
+      ) : null}
     </Box>
   );
 };
 
 class WinstonInkTransport extends Transport {
+  private ink: Instance;
   constructor(opts: any) {
     super(opts);
+    this.ink = render(<TaskTree task={null} />);
   }
 
-  log({ level, message }: any, cb: any) {
-    const { waitUntilExit } = render(
-      <Color key={message} red={level === "error"} yellow={level === "warn"}>
-        [{level}] {message}
-      </Color>
-    );
-    waitUntilExit().then(() => {
-      cb();
-    });
+  log(info: any, cb: any) {
+    if (info.rootTask) {
+      this.ink.rerender(<TaskTree task={info.rootTask} />);
+    }
+    cb();
+  }
+
+  finish() {
+    this.ink.unmount();
   }
 }
 
@@ -180,16 +182,17 @@ export default class Hello extends Command {
       await t.task("second thing", async t => {
         t.logger.info("next things next");
         await t.task("nested under second", async t => {
+          await sleep(5000);
           t.logger.info("doing a nested thing");
         });
       });
       await Promise.all([
         t.task("parallel 1", async t => {
-          await sleep(500);
+          await sleep(1000);
           t.logger.info("done");
         }),
         t.task("parallel 2", async t => {
-          await sleep(500);
+          await sleep(3000);
           t.logger.info("done");
         })
       ]);
