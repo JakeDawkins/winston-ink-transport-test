@@ -12,8 +12,8 @@ const TaskTree = ({
   task,
   logsByTask
 }: {
-  task: Task<unknown> | null;
-  logsByTask: Map<Task<unknown>, any[]>;
+  task: Task | null;
+  logsByTask: Map<Task, any[]>;
 }) => {
   if (task == null) {
     return <Box>Initializing...</Box>;
@@ -73,7 +73,7 @@ const TaskTree = ({
 
 class WinstonInkTransport extends Transport {
   private ink: Instance;
-  private logsByTask = new Map<Task<unknown>, any[]>();
+  private logsByTask = new Map<Task, any[]>();
   constructor(opts: any) {
     super(opts);
     this.ink = render(<TaskTree task={null} logsByTask={this.logsByTask} />);
@@ -81,7 +81,7 @@ class WinstonInkTransport extends Transport {
 
   log(info: any, cb: any) {
     if (!info.meta && info.task) {
-      const task = info.task as Task<unknown>;
+      const task = info.task as Task;
       if (!this.logsByTask.has(task)) {
         this.logsByTask.set(task, []);
       }
@@ -100,7 +100,7 @@ class WinstonInkTransport extends Transport {
   }
 }
 
-type TaskBody<T> = (t: Task<T>) => Promise<T>;
+type TaskBody<T> = (t: Task) => Promise<T>;
 
 enum TaskStatus {
   PENDING,
@@ -109,15 +109,14 @@ enum TaskStatus {
   FAILED
 }
 
-class Task<T> {
+class Task {
   public readonly logger: winston.Logger;
-  private _subtasks: Task<unknown>[] = [];
+  private _subtasks: Task[] = [];
   private _status: TaskStatus = TaskStatus.PENDING;
   constructor(
     logger: winston.Logger,
     public readonly title: string | null,
-    public readonly parent: Task<unknown> | null,
-    private body: TaskBody<T>
+    public readonly parent: Task | null
   ) {
     if (title === null && parent !== null) {
       throw Error("Non-root tasks must have a title");
@@ -132,7 +131,7 @@ class Task<T> {
       rootTask: this.rootTask()
     });
   }
-  get subtasks(): ReadonlyArray<Task<unknown>> {
+  get subtasks(): ReadonlyArray<Task> {
     return this._subtasks;
   }
   get status(): TaskStatus {
@@ -147,7 +146,7 @@ class Task<T> {
     }
     return [...this.parent.path(), this.title];
   }
-  rootTask(): Task<unknown> {
+  rootTask(): Task {
     return this.parent === null ? this : this.parent.rootTask();
   }
 
@@ -156,11 +155,11 @@ class Task<T> {
     this.logger.info("status change", { meta: true });
   }
 
-  async run(): Promise<T> {
+  async run<T>(body: TaskBody<T>): Promise<T> {
     this.setStatus(TaskStatus.RUNNING);
     this.logger.info("starting", { meta: true });
     try {
-      return await this.body(this);
+      return await body(this);
     } catch (e) {
       this.setStatus(TaskStatus.FAILED);
       throw e;
@@ -173,9 +172,9 @@ class Task<T> {
   }
 
   async task<U>(subTitle: string, subBody: TaskBody<U>) {
-    const subTask = new Task<U>(this.logger, subTitle, this, subBody);
+    const subTask = new Task(this.logger, subTitle, this);
     this._subtasks.push(subTask);
-    return await subTask.run();
+    return await subTask.run(subBody);
   }
 
   async wait<U>(p: Promise<U>): Promise<U> {
@@ -192,7 +191,7 @@ async function runTasks<T>(
   logger: winston.Logger,
   body: TaskBody<T>
 ): Promise<T> {
-  return await new Task(logger, null, null, body).run();
+  return await new Task(logger, null, null).run(body);
 }
 
 export default class Hello extends Command {
@@ -259,13 +258,13 @@ export default class Hello extends Command {
         ]);
 
         await t.task("a few things in a row with pending", async t => {
-          const t1 = t.task<number>("calculate a number", async t => {
+          const t1 = t.task("calculate a number", async t => {
             await sleep(2000);
-            const answer: number = 123;
+            const answer = 123;
             t.logger.info(`Answer is ${answer}`);
             return answer;
           });
-          const t2 = t.task<number>("square it", async t => {
+          const t2 = t.task("square it", async t => {
             const t1Result = await t.wait(t1);
             await sleep(2000);
             const squared = t1Result * t1Result;
