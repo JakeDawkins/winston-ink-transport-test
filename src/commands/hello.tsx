@@ -38,7 +38,7 @@ const TaskTree = ({
             </Color>
           )}
           {status === TaskStatus.SUCEEDED && <Color green>{"✔ "}</Color>}
-          {status === TaskStatus.FAILED && <Color red>{"X "}</Color>}
+          {status === TaskStatus.FAILED && <Color red>{"✖️ "}</Color>}
           {status === TaskStatus.PENDING && <Color gray>{"… "}</Color>}
           {title && <Text>{title}</Text>}
         </Box>
@@ -131,7 +131,7 @@ type TaskLogInfo = logform.TransformableInfo & {
 class Task {
   public readonly logger: winston.Logger;
   private _subtasks: Task[] = [];
-  private _status!: TaskStatus;  // ! is our way of convincing TypeScript that we initialize it via setStatus
+  private _status!: TaskStatus; // ! is our way of convincing TypeScript that we initialize it via setStatus
   private _originalTitle: string | null;
   private _title: string | null;
   constructor(
@@ -199,7 +199,9 @@ class Task {
     const oldStatus = this._status;
     if (oldStatus !== newStatus) {
       this._status = newStatus;
-      this.logger.info("status change", {
+      this.logger.log({
+        level: "task",
+        message: "status-change",
         taskEvent: {
           statusChange: {
             newStatus,
@@ -251,142 +253,204 @@ export default class Hello extends Command {
   static flags = {
     name: flags.string({ char: "n", description: "name to print" }),
     force: flags.boolean({ char: "f" }),
-    ink: flags.boolean({ char: "i" })
+    output: flags.string({
+      char: "o",
+      default: "ink",
+      options: ["ink", "json", "json-pretty", "logs"]
+    })
   };
 
   async run() {
     const { flags } = this.parse(Hello);
     const name = flags.name || "world";
 
-    const inkTransport: WinstonInkTransport | null = flags.ink
-      ? new WinstonInkTransport({})
-      : null;
+    let transport: Transport;
+    const customLevels = {
+      levels: {
+        error: 0,
+        warn: 1,
+        info: 2,
+        task: 3,
+        debug: 4
+      },
+      colors: {
+        error: "red",
+        warn: "yellow",
+        info: "green",
+        task: "magenta",
+        debug: "blue"
+      }
+    };
+
+    switch (flags.output) {
+      case "ink":
+        transport = new WinstonInkTransport({});
+        break;
+      case "logs":
+        transport = new winston.transports.Console({
+          format: winston.format.combine(
+            winston.format(info => {
+              if (info.task instanceof Task) {
+                const event = info as TaskLogInfo;
+                if (event.task.isRoot()) {
+                  return false;
+                }
+                let color: ((s: string) => string) | undefined;
+                if (event.taskEvent) {
+                  if ("statusChange" in event.taskEvent) {
+                    switch (event.taskEvent.statusChange.newStatus) {
+                      case TaskStatus.RUNNING:
+                        color = colors.magenta;
+                        event.message = "Starting!";
+                        break;
+                      case TaskStatus.SUCEEDED:
+                        color = colors.green;
+                        event.message = "✔ Success!";
+                        break;
+                      case TaskStatus.FAILED:
+                        color = colors.red;
+                        event.message = "✖️ Failed!";
+                        break;
+                      case TaskStatus.PENDING:
+                        // Don't log anything for a pending task.
+                        return false;
+                      default:
+                        throw Error(`unknown end status ${event.task.status}`);
+                    }
+                  }
+                  // Don't specially handle title change: we expect title changes to come with a log record.
+                }
+                event.message = `[${event.task.path().join(" -> ")}] ${
+                  event.message
+                }`;
+                if (color) {
+                  event.message = color(event.message);
+                }
+              }
+              return info;
+            })(),
+            winston.format.cli({ levels: customLevels.levels })
+          )
+        });
+        break;
+      case "json":
+      case "json-pretty":
+        transport = new winston.transports.Console({
+          format: winston.format.combine(
+            winston.format(info => {
+              if (info.task instanceof Task) {
+                info.task = info.task.path();
+              }
+              return info;
+            })(),
+            winston.format.json({
+              space: flags.output === "json-pretty" ? 2 : undefined
+            })
+          )
+        });
+        break;
+      default:
+        throw Error("invalid output format");
+    }
 
     const logger = winston.createLogger({
-      transports: [
-        inkTransport ??
-          new winston.transports.Console({
-            format: winston.format.combine(
-              winston.format(info => {
-                if (info.task instanceof Task) {
-                  const event = info as TaskLogInfo;
-                  if (event.task.isRoot()) {
-                    return false;
-                  }
-                  if (event.taskEvent) {
-                    if ("statusChange" in event.taskEvent) {
-                      switch (event.taskEvent.statusChange.newStatus) {
-                        case TaskStatus.RUNNING:
-                          event.message = colors.yellow("Starting!");
-                          break;
-                        case TaskStatus.SUCEEDED:
-                          event.message = colors.green("✔ Success!");
-                          break;
-                        case TaskStatus.FAILED:
-                          event.message = colors.red("X Failed!");
-                          break;
-                        case TaskStatus.PENDING:
-                          // Don't log anything for a pending task.
-                          return false;
-                        default:
-                          throw Error(
-                            `unknown end status ${event.task.status}`
-                          );
-                      }
-                    }
-                    // Don't specially handle title change: we expect title changes to come with a log record.
-                  }
-                  event.message = `[${event.task.path().join(" -> ")}] ${
-                    event.message
-                  }`;
-                }
-                return info;
-              })(),
-              winston.format.cli()
-            )
-          })
-      ],
-      exitOnError: false
+      transports: [transport],
+      // XXX one big problem with using Winston to update Ink is that if we set
+      //     the log level to something that blocks the metadata updates, Ink breaks???
+      //     maybe we just don't support setting log levels in ink mode.
+      level: "task",
+      levels: customLevels.levels
     });
+    winston.addColors(customLevels.colors);
 
     logger.info(`hello ${name} from ./src/commands/hello.ts`);
 
     if (flags.force) logger.warn(`The --force is with you, ${name}.`);
 
     try {
-      await runTasks(logger, async t => {
-        await t.task("A tree of tasks", async t => {
-          t.logger.info("If a task logs...");
-          t.logger.warn("... it shows up at the right spot in the tree");
-        });
-
-        await t.task("These run sequentially", async t => {
-          await t.task("... and can be nested", async t => {
-            await sleep(300);
+      try {
+        await runTasks(logger, async t => {
+          await t.task("A tree of tasks", async t => {
+            t.logger.info("If a task logs...");
+            t.logger.warn("... it shows up at the right spot in the tree");
           });
-          await t.task("... like this!", async t => {
-            await sleep(500);
-            await t.task("So deep!", async t => {});
+
+          await t.task("These run sequentially", async t => {
+            await t.task("... and can be nested", async t => {
+              await sleep(300);
+            });
+            await t.task("... like this!", async t => {
+              await sleep(500);
+              await t.task("So deep!", async t => {});
+            });
           });
-        });
 
-        await t.task("Tasks can run in parallel", async t => {
-          await Promise.all([
-            t.task("And end in...", async t => {
-              t.logger.info("Waiting a while");
-              await sleep(5000);
-              t.logger.info("Done!");
-            }),
-            t.task("...either order", async t => {
-              t.logger.info("Waiting a bit");
-              await sleep(2000);
-              t.logger.info("Done!");
-            })
-          ]);
-        });
+          await t.task("Tasks can run in parallel", async t => {
+            await Promise.all([
+              t.task("And end in...", async t => {
+                t.logger.info("Waiting a while");
+                await sleep(5000);
+                t.logger.info("Done!");
+              }),
+              t.task("...either order", async t => {
+                t.logger.info("Waiting a bit");
+                await sleep(2000);
+                t.logger.info("Done!");
+              })
+            ]);
+          });
 
-        await t.task(
-          "Tasks can run sequentially with later tasks 'pending', and change their titles",
-          async t => {
-            function appendTitle<T>(t: Task, result: T): T {
-              t.setTitle(`${t.title}: ${result}!`, {
-                level: "info",
-                message: `Result is ${result}!`
+          await t.task(
+            "Tasks can run sequentially with later tasks 'pending', and change their titles",
+            async t => {
+              function appendTitle<T>(t: Task, result: T): T {
+                t.setTitle(`${t.title}: ${result}!`, {
+                  level: "info",
+                  message: `Result is ${result}!`
+                });
+                return result;
+              }
+              const t1 = t.task("Calculate a number", async t => {
+                await sleep(2000);
+                return appendTitle(t, 123);
               });
-              return result;
+              const t2 = t.pendingTask("Square it", [t1], async t => {
+                const t1Result = await t1;
+                await sleep(2000);
+                return appendTitle(t, t1Result * t1Result);
+              });
+              const t3 = t.pendingTask("Negate it", [t2], async t => {
+                const t2Result = await t2;
+                await sleep(2000);
+                return appendTitle(t, -t2Result);
+              });
+              await Promise.all([t1, t2, t3]);
             }
-            const t1 = t.task("Calculate a number", async t => {
-              await sleep(2000);
-              return appendTitle(t, 123);
-            });
-            const t2 = t.pendingTask("Square it", [t1], async t => {
-              const t1Result = await t1;
-              await sleep(2000);
-              return appendTitle(t, t1Result * t1Result);
-            });
-            const t3 = t.pendingTask("Negate it", [t2], async t => {
-              const t2Result = await t2;
-              await sleep(2000);
-              return appendTitle(t, -t2Result);
-            });
-            await Promise.all([t1, t2, t3]);
-          }
-        );
+          );
 
-        await t.task("Tasks can fail...", async t => {
-          await t.task("... and they make their parents fail too.", async t => {
-            t.logger.warn("I'm going to fail soon!");
-            await sleep(500);
-            throw new Error("oh no");
+          await t.task("Tasks can fail...", async t => {
+            await t.task(
+              "... and they make their parents fail too.",
+              async t => {
+                t.logger.warn("I'm going to fail soon!");
+                await sleep(500);
+                throw new Error("oh no");
+              }
+            );
           });
-        });
 
-        await t.task("This task never shows up", async t => {});
-      });
-    } finally {
-      if (flags.ink) {
-        inkTransport?.unmount();
+          await t.task("This task never shows up", async t => {});
+        });
+      } finally {
+        if (transport instanceof WinstonInkTransport) {
+          transport.unmount();
+        }
       }
+    } catch (e) {
+      // XXX currently this error isn't displaying in ink mode --- probably should move it before
+      //     unmount and make sure that non-task logs show up somewhere?
+      logger.error(`Command failed: ${e.message}`, { error: e });
+      this.exit(1);
     }
   }
 }
