@@ -256,7 +256,7 @@ export default class Hello extends Command {
     output: flags.string({
       char: "o",
       default: "ink",
-      options: ["ink", "json", "json-pretty", "logs"]
+      options: ["ink", "json", "json-pretty", "logs", "logs-monochrome"]
     })
   };
 
@@ -287,52 +287,58 @@ export default class Hello extends Command {
         transport = new WinstonInkTransport({});
         break;
       case "logs":
-        transport = new winston.transports.Console({
-          format: winston.format.combine(
-            winston.format(info => {
-              if (info.task instanceof Task) {
-                const event = info as TaskLogInfo;
-                if (event.task.isRoot()) {
-                  return false;
-                }
-                let color: ((s: string) => string) | undefined;
-                if (event.taskEvent) {
-                  if ("statusChange" in event.taskEvent) {
-                    switch (event.taskEvent.statusChange.newStatus) {
-                      case TaskStatus.RUNNING:
-                        color = colors.magenta;
-                        event.message = "Starting!";
-                        break;
-                      case TaskStatus.SUCEEDED:
-                        color = colors.green;
-                        event.message = "✔ Success!";
-                        break;
-                      case TaskStatus.FAILED:
-                        color = colors.red;
-                        event.message = "✖️ Failed!";
-                        break;
-                      case TaskStatus.PENDING:
-                        // Don't log anything for a pending task.
-                        return false;
-                      default:
-                        throw Error(`unknown end status ${event.task.status}`);
-                    }
-                  }
-                  // Don't specially handle title change: we expect title changes to come with a log record.
-                }
-                event.message = `[${event.task.path().join(" -> ")}] ${
-                  event.message
-                }`;
-                if (color) {
-                  event.message = color(event.message);
-                }
+      case "logs-monochrome": {
+        const formats = [
+          winston.format(info => {
+            if (info.task instanceof Task) {
+              const event = info as TaskLogInfo;
+              if (event.task.isRoot()) {
+                return false;
               }
-              return info;
-            })(),
-            winston.format.cli({ levels: customLevels.levels })
-          )
+              let color: ((s: string) => string) | undefined;
+              if (event.taskEvent) {
+                if ("statusChange" in event.taskEvent) {
+                  switch (event.taskEvent.statusChange.newStatus) {
+                    case TaskStatus.RUNNING:
+                      color = colors.magenta;
+                      event.message = "Starting!";
+                      break;
+                    case TaskStatus.SUCEEDED:
+                      color = colors.green;
+                      event.message = "✔ Success!";
+                      break;
+                    case TaskStatus.FAILED:
+                      color = colors.red;
+                      event.message = "✖️ Failed!";
+                      break;
+                    case TaskStatus.PENDING:
+                      // Don't log anything for a pending task.
+                      return false;
+                    default:
+                      throw Error(`unknown end status ${event.task.status}`);
+                  }
+                }
+                // Don't specially handle title change: we expect title changes to come with a log record.
+              }
+              event.message = `[${event.task.path().join(" -> ")}] ${
+                event.message
+              }`;
+              if (color) {
+                event.message = color(event.message);
+              }
+            }
+            return info;
+          })(),
+          winston.format.cli({ levels: customLevels.levels })
+        ];
+        if (flags.output === "logs-monochrome") {
+          formats.push(winston.format.uncolorize());
+        }
+        transport = new winston.transports.Console({
+          format: winston.format.combine(...formats)
         });
         break;
+      }
       case "json":
       case "json-pretty":
         transport = new winston.transports.Console({
