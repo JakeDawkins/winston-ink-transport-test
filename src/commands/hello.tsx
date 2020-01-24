@@ -47,7 +47,7 @@ const TaskTree = ({
           {logs.map((log, i) => (
             // XXX filter out if transform returns falsey
             <Box key={i}>
-              🗒️ {treeLogFormatter.transform(log)[Symbol.for("message")]}
+              {"🗒️ "} {treeLogFormatter.transform(log)[Symbol.for("message")]}
             </Box>
           ))}
         </Box>
@@ -80,16 +80,16 @@ class WinstonInkTransport extends Transport {
   }
 
   log(info: any, cb: any) {
-    if (!info.meta && info.task) {
-      const task = info.task as Task;
-      if (!this.logsByTask.has(task)) {
-        this.logsByTask.set(task, []);
+    if (info.task) {
+      if (!info.meta) {
+        const task = info.task as Task;
+        if (!this.logsByTask.has(task)) {
+          this.logsByTask.set(task, []);
+        }
+        this.logsByTask.get(task)!.push(info);
       }
-      this.logsByTask.get(task)!.push(info);
-    }
-    if (info.rootTask) {
       this.ink.rerender(
-        <TaskTree task={info.rootTask} logsByTask={this.logsByTask} />
+        <TaskTree task={info.task.rootTask()} logsByTask={this.logsByTask} />
       );
     }
     cb();
@@ -113,9 +113,10 @@ class Task {
   public readonly logger: winston.Logger;
   private _subtasks: Task[] = [];
   private _status: TaskStatus = TaskStatus.PENDING;
+  private _title: string | null;
   constructor(
     logger: winston.Logger,
-    public readonly title: string | null,
+    title: string | null,
     public readonly parent: Task | null
   ) {
     if (title === null && parent !== null) {
@@ -124,11 +125,9 @@ class Task {
     if (title != null && parent == null) {
       throw Error("Root tasks may not have a title");
     }
+    this._title = title;
     this.logger = logger.child({
-      taskTitle: this.title,
-      path: this.path(),
-      task: this,
-      rootTask: this.rootTask()
+      task: this
     });
   }
   get subtasks(): ReadonlyArray<Task> {
@@ -136,6 +135,14 @@ class Task {
   }
   get status(): TaskStatus {
     return this._status;
+  }
+  get title(): string | null {
+    return this._title;
+  }
+  setTitle(title: string) {
+    this._title = title;
+    // Not sure how to best display this in CLI style logs.
+    this.logger.info("title change", { meta: true });
   }
   isRoot() {
     return this.parent === null;
@@ -215,8 +222,10 @@ export default class Hello extends Command {
           new winston.transports.Console({
             format: winston.format.combine(
               winston.format(info => {
-                if (info.path) {
-                  info.message = `[${info.path.join(" -> ")}] ${info.message}`;
+                if (info.task instanceof Task && !info.task.isRoot()) {
+                  info.message = `[${info.task.path().join(" -> ")}] ${
+                    info.message
+                  }`;
                 }
                 return info;
               })(),
@@ -233,63 +242,69 @@ export default class Hello extends Command {
 
     try {
       await runTasks(logger, async t => {
-        await t.task("first thing", async t => {
-          t.logger.info("first things first");
+        await t.task("A tree of tasks", async t => {
+          t.logger.info("If a task logs,");
+          t.logger.warn("it shows up at the right spot in the tree")
         });
-        await t.task("second thing", async t => {
-          t.logger.info("next things next");
-          await t.task("nested under second", async t => {
+        await t.task("These run sequentially", async t => {
+          await t.task("... and can be nested", async t => {
             await sleep(300);
-            t.logger.info("doing a nested thing");
+          });
+          await t.task("... like this!", async t => {
+            await sleep(500);
+            await t.task("So deep!", async t => {});
           });
         });
 
-        await Promise.all([
-          t.task("parallel 1", async t => {
-            t.logger.info("waiting");
-            await sleep(5000);
-            t.logger.info("done");
-          }),
-          t.task("parallel 2", async t => {
-            t.logger.info("waiting less time");
-            await sleep(2000);
-            t.logger.info("done");
-          })
-        ]);
-
-        await t.task("a few things in a row with pending", async t => {
-          const t1 = t.task("calculate a number", async t => {
-            await sleep(2000);
-            const answer = 123;
-            t.logger.info(`Answer is ${answer}`);
-            return answer;
-          });
-          const t2 = t.task("square it", async t => {
-            const t1Result = await t.wait(t1);
-            await sleep(2000);
-            const squared = t1Result * t1Result;
-            t.logger.info(`I got ${squared}`);
-            return squared;
-          });
-          const t3 = t.task("negate it", async t => {
-            const t2Result = await t.wait(t2);
-            await sleep(2000);
-            const negated = -t2Result;
-            t.logger.info(`I got ${negated}`);
-            return negated;
-          });
-          await Promise.all([t1, t2, t3]);
-          t.logger.info(`Final result was ${await t3}`);
+        await t.task("Tasks can run in parallel", async t => {
+          await Promise.all([
+            t.task("And end in...", async t => {
+              t.logger.info("Waiting a while");
+              await sleep(5000);
+              t.logger.info("Done!");
+            }),
+            t.task("...either order", async t => {
+              t.logger.info("Waiting a bit");
+              await sleep(2000);
+              t.logger.info("Done!");
+            })
+          ]);
         });
 
-        await t.task("subtask will fail", async t => {
-          await t.task("this will fail", async t => {
-            t.logger.warn("gonna fail soon");
+        await t.task(
+          "Tasks can run sequentially with later tasks 'pending', and change their titles",
+          async t => {
+            function appendTitle<T>(t: Task, toAppend: T): T {
+              t.setTitle(`${t.title}: ${toAppend}!`);
+              return toAppend;
+            }
+            const t1 = t.task("Calculate a number", async t => {
+              await sleep(2000);
+              return appendTitle(t, 123);
+            });
+            const t2 = t.task("Square it", async t => {
+              const t1Result = await t.wait(t1);
+              await sleep(2000);
+              return appendTitle(t, t1Result * t1Result);
+            });
+            const t3 = t.task("Negate it", async t => {
+              const t2Result = await t.wait(t2);
+              await sleep(2000);
+              return appendTitle(t, -t2Result);
+            });
+            await Promise.all([t1, t2, t3]);
+          }
+        );
+
+        await t.task("Tasks can fail...", async t => {
+          await t.task("... and they make their parents fail too.", async t => {
+            t.logger.warn("I'm going to fail soon!");
             await sleep(500);
             throw new Error("oh no");
           });
         });
-        await t.task("in the end", async t => {});
+
+        await t.task("This task never shows up", async t => {});
       });
     } finally {
       if (flags.ink) {
