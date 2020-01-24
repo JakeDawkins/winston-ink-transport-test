@@ -1,10 +1,12 @@
 import { Command, flags } from "@oclif/command";
 import winston from "winston";
+import logform from "logform";
 import Transport from "winston-transport";
 import React from "react";
 import { render, Color, Box, Text, Instance } from "ink";
 import sleep from "sleep-promise";
 import Spinner from "ink-spinner";
+import colors from "colors/safe";
 
 const treeLogFormatter = winston.format.printf(info => info.message);
 
@@ -44,12 +46,16 @@ const TaskTree = ({
 
       {logs && logs.length ? (
         <Box flexDirection="column" marginLeft={2}>
-          {logs.map((log, i) => (
-            // XXX filter out if transform returns falsey
-            <Box key={i}>
-              {"🗒️ "} {treeLogFormatter.transform(log)[Symbol.for("message")]}
-            </Box>
-          ))}
+          {logs
+            .map(
+              log => treeLogFormatter.transform(log)?.[Symbol.for("message")]
+            )
+            .filter(m => m)
+            .map((message, i) => (
+              <Box key={i}>
+                {"🗒️ "} {message}
+              </Box>
+            ))}
         </Box>
       ) : null}
 
@@ -81,7 +87,7 @@ class WinstonInkTransport extends Transport {
 
   log(info: any, cb: any) {
     if (info.task) {
-      if (!info.meta) {
+      if (!info.taskEvent) {
         const task = info.task as Task;
         if (!this.logsByTask.has(task)) {
           this.logsByTask.set(task, []);
@@ -108,11 +114,25 @@ enum TaskStatus {
   SUCEEDED,
   FAILED
 }
+interface TaskLogEventStatusChange {
+  statusChange: { oldStatus?: TaskStatus; newStatus: TaskStatus };
+}
+interface TaskLogEventTitleChange {
+  titleChange: { oldTitle: string; newTitle: string };
+}
+
+type TaskLogEvent = TaskLogEventStatusChange | TaskLogEventTitleChange;
+
+type TaskLogInfo = logform.TransformableInfo & {
+  task: Task;
+  taskEvent?: TaskLogEvent;
+};
 
 class Task {
   public readonly logger: winston.Logger;
   private _subtasks: Task[] = [];
-  private _status: TaskStatus = TaskStatus.PENDING;
+  private _status!: TaskStatus;  // ! is our way of convincing TypeScript that we initialize it via setStatus
+  private _originalTitle: string | null;
   private _title: string | null;
   constructor(
     logger: winston.Logger,
@@ -125,10 +145,18 @@ class Task {
     if (title != null && parent == null) {
       throw Error("Root tasks may not have a title");
     }
+    if (parent) {
+      parent._subtasks.push(this);
+    }
+    this._originalTitle = title;
     this._title = title;
     this.logger = logger.child({
       task: this
     });
+
+    // This needs to be last, since it sends a message that triggers
+    // Ink refresh.
+    this.setStatus(TaskStatus.PENDING);
   }
   get subtasks(): ReadonlyArray<Task> {
     return this._subtasks;
@@ -139,32 +167,51 @@ class Task {
   get title(): string | null {
     return this._title;
   }
-  setTitle(title: string) {
-    this._title = title;
-    // Not sure how to best display this in CLI style logs.
-    this.logger.info("title change", { meta: true });
+  // setTitle updates the title for Ink view, but not for the normal log view's path.
+  // For the normal log view, it logs logRecord instead.
+  setTitle(newTitle: string, logRecord: winston.LogEntry) {
+    const oldTitle = this._title;
+    this._title = newTitle;
+    this.logger.log({
+      ...logRecord,
+      taskEvent: {
+        titleChange: {
+          newTitle,
+          oldTitle
+        }
+      }
+    });
   }
   isRoot() {
     return this.parent === null;
   }
   path(): string[] {
-    if (this.title === null || this.parent === null) {
+    if (this._originalTitle === null || this.parent === null) {
       return [];
     }
-    return [...this.parent.path(), this.title];
+    return [...this.parent.path(), this._originalTitle];
   }
   rootTask(): Task {
     return this.parent === null ? this : this.parent.rootTask();
   }
 
-  private setStatus(status: TaskStatus) {
-    this._status = status;
-    this.logger.info("status change", { meta: true });
+  private setStatus(newStatus: TaskStatus) {
+    const oldStatus = this._status;
+    if (oldStatus !== newStatus) {
+      this._status = newStatus;
+      this.logger.info("status change", {
+        taskEvent: {
+          statusChange: {
+            newStatus,
+            oldStatus
+          }
+        }
+      });
+    }
   }
 
   async run<T>(body: TaskBody<T>): Promise<T> {
     this.setStatus(TaskStatus.RUNNING);
-    this.logger.info("starting", { meta: true });
     try {
       return await body(this);
     } catch (e) {
@@ -174,23 +221,22 @@ class Task {
       if (this._status !== TaskStatus.FAILED) {
         this.setStatus(TaskStatus.SUCEEDED);
       }
-      this.logger.info("ending", { meta: true });
     }
   }
 
   async task<U>(subTitle: string, subBody: TaskBody<U>) {
     const subTask = new Task(this.logger, subTitle, this);
-    this._subtasks.push(subTask);
     return await subTask.run(subBody);
   }
 
-  async wait<U>(p: Promise<U>): Promise<U> {
-    this.setStatus(TaskStatus.PENDING);
-    try {
-      return await p;
-    } finally {
-      this.setStatus(TaskStatus.RUNNING);
-    }
+  async pendingTask<U>(
+    subTitle: string,
+    pendingUntil: Promise<unknown>[],
+    subBody: TaskBody<U>
+  ) {
+    const subTask = new Task(this.logger, subTitle, this);
+    await Promise.all(pendingUntil);
+    return await subTask.run(subBody);
   }
 }
 
@@ -222,9 +268,36 @@ export default class Hello extends Command {
           new winston.transports.Console({
             format: winston.format.combine(
               winston.format(info => {
-                if (info.task instanceof Task && !info.task.isRoot()) {
-                  info.message = `[${info.task.path().join(" -> ")}] ${
-                    info.message
+                if (info.task instanceof Task) {
+                  const event = info as TaskLogInfo;
+                  if (event.task.isRoot()) {
+                    return false;
+                  }
+                  if (event.taskEvent) {
+                    if ("statusChange" in event.taskEvent) {
+                      switch (event.taskEvent.statusChange.newStatus) {
+                        case TaskStatus.RUNNING:
+                          event.message = colors.yellow("Starting!");
+                          break;
+                        case TaskStatus.SUCEEDED:
+                          event.message = colors.green("✔ Success!");
+                          break;
+                        case TaskStatus.FAILED:
+                          event.message = colors.red("X Failed!");
+                          break;
+                        case TaskStatus.PENDING:
+                          // Don't log anything for a pending task.
+                          return false;
+                        default:
+                          throw Error(
+                            `unknown end status ${event.task.status}`
+                          );
+                      }
+                    }
+                    // Don't specially handle title change: we expect title changes to come with a log record.
+                  }
+                  event.message = `[${event.task.path().join(" -> ")}] ${
+                    event.message
                   }`;
                 }
                 return info;
@@ -243,9 +316,10 @@ export default class Hello extends Command {
     try {
       await runTasks(logger, async t => {
         await t.task("A tree of tasks", async t => {
-          t.logger.info("If a task logs,");
-          t.logger.warn("it shows up at the right spot in the tree")
+          t.logger.info("If a task logs...");
+          t.logger.warn("... it shows up at the right spot in the tree");
         });
+
         await t.task("These run sequentially", async t => {
           await t.task("... and can be nested", async t => {
             await sleep(300);
@@ -274,21 +348,24 @@ export default class Hello extends Command {
         await t.task(
           "Tasks can run sequentially with later tasks 'pending', and change their titles",
           async t => {
-            function appendTitle<T>(t: Task, toAppend: T): T {
-              t.setTitle(`${t.title}: ${toAppend}!`);
-              return toAppend;
+            function appendTitle<T>(t: Task, result: T): T {
+              t.setTitle(`${t.title}: ${result}!`, {
+                level: "info",
+                message: `Result is ${result}!`
+              });
+              return result;
             }
             const t1 = t.task("Calculate a number", async t => {
               await sleep(2000);
               return appendTitle(t, 123);
             });
-            const t2 = t.task("Square it", async t => {
-              const t1Result = await t.wait(t1);
+            const t2 = t.pendingTask("Square it", [t1], async t => {
+              const t1Result = await t1;
               await sleep(2000);
               return appendTitle(t, t1Result * t1Result);
             });
-            const t3 = t.task("Negate it", async t => {
-              const t2Result = await t.wait(t2);
+            const t3 = t.pendingTask("Negate it", [t2], async t => {
+              const t2Result = await t2;
               await sleep(2000);
               return appendTitle(t, -t2Result);
             });
