@@ -3,7 +3,13 @@ import winston, { transports } from "winston";
 import logform from "logform";
 import Transport from "winston-transport";
 import React from "react";
-import{ Instance as InkInstance, render as inkRender, Color, Box, Text } from "ink";
+import {
+  Instance as InkInstance,
+  render as inkRender,
+  Color,
+  Box,
+  Text
+} from "ink";
 import sleep from "sleep-promise";
 import Spinner from "ink-spinner";
 import colors from "colors/safe";
@@ -20,7 +26,7 @@ const TaskHeader = ({ task }: { task: Task }) => (
             <Spinner type="dots" />{" "}
           </Color>
         ),
-        [TaskStatus.SUCEEDED]: <Color green>{"✔ "}</Color>,
+        [TaskStatus.SUCCEEDED]: <Color green>{"✔ "}</Color>,
         [TaskStatus.FAILED]: <Color red>{"✖️ "}</Color>,
         [TaskStatus.PENDING]: <Color gray>{"… "}</Color>
       }[task.status]
@@ -84,6 +90,7 @@ class InkTaskUI implements TaskUI {
       this.ink!.unmount();
       this.taskRunner = null;
       this.ink = null;
+      this.logsByTask.clear();
     };
   }
   winstonTransport(): Transport {
@@ -107,9 +114,8 @@ class InkTaskUI implements TaskUI {
   private rootComponent() {
     return (
       <TaskTree
-        // XXX eliminate rootTask?
         // XXX eliminate all these bangs?
-        tasks={this.taskRunner!.rootTask.subtasks}
+        tasks={this.taskRunner!.subtasks}
         logsByTask={this.logsByTask}
       />
     );
@@ -118,26 +124,25 @@ class InkTaskUI implements TaskUI {
 
 class LoggingTaskUI implements TaskUI {
   constructor(private format: logform.Format) {}
-  private taskRunner: TaskRunner | null = null;
   start(taskRunner: TaskRunner) {
-    this.taskRunner = taskRunner;
-    const onTitleChange = () => 0;
     const stoppers = [
-      taskRunner.emitter.on("statusChange", taskEvent => {
-        taskEvent.task.logger.log({
-          level: "task",
-          message: "statusChange",
-          taskEvent
-        });
-        // ...
-      }),
+      taskRunner.emitter.on(
+        "statusChange",
+        ({ task, oldStatus, newStatus }) => {
+          task.logger.log({
+            level: "task",
+            message: "statusChange",
+            taskEvent: { statusChange: { oldStatus, newStatus } }
+          });
+          // ...
+        }
+      ),
       taskRunner.emitter.on("titleChange", ({ task, logEntry }) => {
         task.logger.log(logEntry);
       })
     ];
     return () => {
       stoppers.forEach(s => s());
-      this.taskRunner = null;
     };
   }
   winstonTransport(): Transport {
@@ -147,36 +152,17 @@ class LoggingTaskUI implements TaskUI {
   }
 }
 
-// here's a bit of an XXX issue:
-//  - InkTaskTree wants a TaskRunner
-//  - TaskRunner wants a Logger
-//  - Logger wants a Transport
-//  - Transport wants an InkTaskTree
-// I think I break this by adding the transport later?
-// no actually I first make the InkTaskUI, then make a Logger from it, then make a TaskRunner from that
-
-// I think that LoggingTaskUI provides a transport and also converts statusChange/titleChange into extra log lines
-
+type RootTaskBody<T> = (t: TaskContainer) => Promise<T>;
 type TaskBody<T> = (t: Task) => Promise<T>;
 
 enum TaskStatus {
-  PENDING,
-  RUNNING,
-  SUCEEDED,
-  FAILED
+  PENDING = "PENDING",
+  RUNNING = "RUNNING",
+  SUCCEEDED = "SUCCEEDED",
+  FAILED = "FAILED"
 }
 
-// XXX use this to define events
-interface TaskLogEventStatusChange {
-  statusChange: { task: Task; oldStatus?: TaskStatus; newStatus: TaskStatus };
-}
-interface TaskLogEventTitleChange {
-  titleChange: { task: Task; oldTitle: string; newTitle: string };
-}
-
-type TaskLogInfo = logform.TransformableInfo &
-  (TaskLogEventStatusChange | TaskLogEventTitleChange);
-
+// Defines the emittery events that TaskRunner.emitter uses.
 interface TaskRunnerEvents {
   statusChange: { task: Task; oldStatus?: TaskStatus; newStatus: TaskStatus };
   titleChange: {
@@ -186,46 +172,96 @@ interface TaskRunnerEvents {
     logEntry: winston.LogEntry;
   };
 }
-class TaskRunner {
-  // XXX eliminating root task would be great because right now root task emits
-  // as soon as created, yuck
-  public readonly emitter = new Emittery.Typed<TaskRunnerEvents>();
-  public readonly rootTask = new Task(this, null, null);
-  constructor(public readonly logger: winston.Logger) {}
 
-  async run<T>(ui: TaskUI, body: TaskBody<T>): Promise<T> {
+// This defines the task field that Task.logger adds to every message logged
+// through it, and the taskEvent field that LoggingTaskUI adds to log
+// entries based on TaskRunner events.
+//
+type TaskLogInfo = logform.TransformableInfo & {
+  task: Task;
+  taskEvent:
+    | { titleChange: { task: Task; oldTitle: string; newTitle: string } }
+    | { statusChange: { oldStatus?: TaskStatus; newStatus: TaskStatus } };
+};
+
+abstract class TaskContainer {
+  abstract get parent(): TaskContainer | null;
+  abstract get runner(): TaskRunner;
+  abstract path(): string[];
+
+  private readonly _subtasks: Task[] = [];
+  get subtasks(): ReadonlyArray<Task> {
+    return this._subtasks;
+  }
+  // would make this protected but can't
+  addTask(t: Task) {
+    if (t.parent !== this) {
+      throw Error("addTask called wrong");
+    }
+    this._subtasks.push(t);
+  }
+  isRoot() {
+    return this.parent === null;
+  }
+
+  async task<U>(subTitle: string, subBody: TaskBody<U>) {
+    const subTask = new Task(this, this.runner, subTitle);
+    return await subTask.run(subBody);
+  }
+
+  async pendingTask<U>(
+    subTitle: string,
+    pendingUntil: Promise<unknown>[],
+    subBody: TaskBody<U>
+  ) {
+    const subTask = new Task(this, this.runner, subTitle);
+    await Promise.all(pendingUntil);
+    return await subTask.run(subBody);
+  }
+}
+
+class TaskRunner extends TaskContainer {
+  public readonly emitter = new Emittery.Typed<TaskRunnerEvents>();
+
+  constructor(public readonly logger: winston.Logger) {
+    super();
+  }
+
+  get parent() {
+    return null;
+  }
+  get runner() {
+    return this;
+  }
+  path() {
+    return [];
+  }
+
+  async run<T>(ui: TaskUI, body: RootTaskBody<T>): Promise<T> {
     const stopUI = ui.start(this);
     try {
-      return await this.rootTask.run(body);
+      return await body(this);
     } finally {
       stopUI();
     }
   }
 }
 
-class Task {
+class Task extends TaskContainer {
   public readonly logger: winston.Logger;
-  private _subtasks: Task[] = [];
   private _status!: TaskStatus; // ! is our way of convincing TypeScript that we initialize it via setStatus
-  private _originalTitle: string | null;
-  private _title: string | null;
+  private _updatedTitle: string;
+  private _title: string;
   constructor(
-    public readonly runner: TaskRunner,
-    title: string | null,
-    public readonly parent: Task | null
+    readonly parent: TaskContainer,
+    readonly runner: TaskRunner,
+    title: string
   ) {
-    if (title === null && parent !== null) {
-      throw Error("Non-root tasks must have a title");
-    }
-    if (title != null && parent == null) {
-      throw Error("Root tasks may not have a title");
-    }
-    if (parent) {
-      parent._subtasks.push(this);
-    }
-    this._originalTitle = title;
+    super();
+    parent.addTask(this);
     this._title = title;
-    this.logger = runner.logger.child({
+    this._updatedTitle = title;
+    this.logger = this.runner.logger.child({
       task: this
     });
 
@@ -233,36 +269,27 @@ class Task {
     // Ink refresh.
     this.setStatus(TaskStatus.PENDING);
   }
-  get subtasks(): ReadonlyArray<Task> {
-    return this._subtasks;
+  path(): string[] {
+    return [...this.parent.path(), this._title];
   }
   get status(): TaskStatus {
     return this._status;
   }
-  get title(): string | null {
+  get title(): string {
     return this._title;
   }
-  // XXX update this comment
-  // setTitle updates the title for Ink view, but not for the normal log view's path.
-  // For the normal log view, it logs logEntry instead.
+
+  // setTitle updates the title for InkTaskUI, but not for the path displayed
+  // by LoggingTaskUI. For LoggingTaskUI it just logs logEntry instead.
   setTitle(newTitle: string, logEntry: winston.LogEntry) {
-    const oldTitle = this._title!;  // XXX ban root
-    this._title = newTitle;
+    const oldTitle = this._updatedTitle!; // XXX ban root
+    this._updatedTitle = newTitle;
     this.runner.emitter.emit("titleChange", {
       task: this,
       newTitle,
       oldTitle,
       logEntry
     });
-  }
-  isRoot() {
-    return this.parent === null;
-  }
-  path(): string[] {
-    if (this._originalTitle === null || this.parent === null) {
-      return [];
-    }
-    return [...this.parent.path(), this._originalTitle];
   }
 
   private setStatus(newStatus: TaskStatus) {
@@ -286,24 +313,9 @@ class Task {
       throw e;
     } finally {
       if (this._status !== TaskStatus.FAILED) {
-        this.setStatus(TaskStatus.SUCEEDED);
+        this.setStatus(TaskStatus.SUCCEEDED);
       }
     }
-  }
-
-  async task<U>(subTitle: string, subBody: TaskBody<U>) {
-    const subTask = new Task(this.runner, subTitle, this);
-    return await subTask.run(subBody);
-  }
-
-  async pendingTask<U>(
-    subTitle: string,
-    pendingUntil: Promise<unknown>[],
-    subBody: TaskBody<U>
-  ) {
-    const subTask = new Task(this.runner, subTitle, this);
-    await Promise.all(pendingUntil);
-    return await subTask.run(subBody);
   }
 }
 
@@ -339,8 +351,76 @@ export default class Hello extends Command {
 
     let taskUI: TaskUI;
 
-    if (true) {
-      taskUI = new InkTaskUI();
+    switch (flags.output) {
+      case "ink":
+        taskUI = new InkTaskUI();
+        break;
+      case "logs":
+      case "logs-monochrome": {
+        const formats = [
+          winston.format(info => {
+            if (info.task instanceof Task) {
+              const event = info as TaskLogInfo;
+              let color: ((s: string) => string) | undefined;
+              if (event.taskEvent) {
+                if ("statusChange" in event.taskEvent) {
+                  switch (event.taskEvent.statusChange.newStatus) {
+                    case TaskStatus.RUNNING:
+                      color = colors.magenta;
+                      event.message = "Starting!";
+                      break;
+                    case TaskStatus.SUCCEEDED:
+                      color = colors.green;
+                      event.message = "✔ Success!";
+                      break;
+                    case TaskStatus.FAILED:
+                      color = colors.red;
+                      event.message = "✖️ Failed!";
+                      break;
+                    case TaskStatus.PENDING:
+                      // Don't log anything for a pending task.
+                      return false;
+                    default:
+                      throw Error(`unknown end status ${event.task.status}`);
+                  }
+                }
+                // Don't specially handle title change: we expect title changes to come with a log record.
+              }
+              event.message = `[${event.task.path().join(" -> ")}] ${
+                event.message
+              }`;
+              if (color) {
+                event.message = color(event.message);
+              }
+            }
+            return info;
+          })(),
+          winston.format.cli({ levels: customLevels.levels })
+        ];
+        if (flags.output === "logs-monochrome") {
+          formats.push(winston.format.uncolorize());
+        }
+        taskUI = new LoggingTaskUI(winston.format.combine(...formats));
+        break;
+      }
+      case "json":
+      case "json-pretty":
+        taskUI = new LoggingTaskUI(
+          winston.format.combine(
+            winston.format(info => {
+              if (info.task instanceof Task) {
+                info.task = info.task.path();
+              }
+              return info;
+            })(),
+            winston.format.json({
+              space: flags.output === "json-pretty" ? 2 : undefined
+            })
+          )
+        );
+        break;
+      default:
+        throw Error("invalid output format");
     }
 
     const logger = winston.createLogger({
@@ -349,99 +429,10 @@ export default class Hello extends Command {
       levels: customLevels.levels
     });
 
-    // switch (flags.output) {
-    //   case "ink": {
-    //     const transport = new WinstonInkTransport({});
-    //     const logger = winston.createLogger({
-    //       transports: [transport],
-    //       // XXX one big problem with using Winston to update Ink is that if we set
-    //       //     the log level to something that blocks the metadata updates, Ink breaks???
-    //       //     maybe we just don't support setting log levels in ink mode.
-    //       level: "task",
-    //       levels: customLevels.levels
-    //     });
-
-    //     break;
-    //   }
-    //   case "logs":
-    //   case "logs-monochrome": {
-    //     const formats = [
-    //       winston.format(info => {
-    //         if (info.task instanceof Task) {
-    //           const event = info as TaskLogInfo;
-    //           if (event.task.isRoot()) {
-    //             return false;
-    //           }
-    //           let color: ((s: string) => string) | undefined;
-    //           if (event.taskEvent) {
-    //             if ("statusChange" in event.taskEvent) {
-    //               switch (event.taskEvent.statusChange.newStatus) {
-    //                 case TaskStatus.RUNNING:
-    //                   color = colors.magenta;
-    //                   event.message = "Starting!";
-    //                   break;
-    //                 case TaskStatus.SUCEEDED:
-    //                   color = colors.green;
-    //                   event.message = "✔ Success!";
-    //                   break;
-    //                 case TaskStatus.FAILED:
-    //                   color = colors.red;
-    //                   event.message = "✖️ Failed!";
-    //                   break;
-    //                 case TaskStatus.PENDING:
-    //                   // Don't log anything for a pending task.
-    //                   return false;
-    //                 default:
-    //                   throw Error(`unknown end status ${event.task.status}`);
-    //               }
-    //             }
-    //             // Don't specially handle title change: we expect title changes to come with a log record.
-    //           }
-    //           event.message = `[${event.task.path().join(" -> ")}] ${
-    //             event.message
-    //           }`;
-    //           if (color) {
-    //             event.message = color(event.message);
-    //           }
-    //         }
-    //         return info;
-    //       })(),
-    //       winston.format.cli({ levels: customLevels.levels })
-    //     ];
-    //     if (flags.output === "logs-monochrome") {
-    //       formats.push(winston.format.uncolorize());
-    //     }
-    //     transport = new winston.transports.Console({
-    //       format: winston.format.combine(...formats)
-    //     });
-    //     break;
-    //   }
-    //   case "json":
-    //   case "json-pretty":
-    //     transport = new winston.transports.Console({
-    //       format: winston.format.combine(
-    //         winston.format(info => {
-    //           if (info.task instanceof Task) {
-    //             info.task = info.task.path();
-    //           }
-    //           return info;
-    //         })(),
-    //         winston.format.json({
-    //           space: flags.output === "json-pretty" ? 2 : undefined
-    //         })
-    //       )
-    //     });
-    //     break;
-    //   default:
-    //     throw Error("invalid output format");
-    // }
-
     const runner = new TaskRunner(logger);
 
     try {
-      console.log("WHAT")
       await runner.run(taskUI, async t => {
-        console.log("HI");
         await t.task("A tree of tasks", async t => {
           t.logger.info("If a task logs...");
           t.logger.warn("... it shows up at the right spot in the tree");
@@ -511,9 +502,10 @@ export default class Hello extends Command {
         await t.task("This task never shows up", async t => {});
       });
     } catch (e) {
-      // XXX currently this error isn't displaying in ink mode --- probably should move it before
-      //     unmount and make sure that non-task logs show up somewhere?
-      console.log("yikes", e)
+      // XXX currently this error isn't displaying in ink mode --- probably should
+      // add some sort of explicit failure handling on TaskUI and move this try/catch
+      // into TaskRunner.run?
+      console.log("yikes", e);
       logger.error(`Command failed: ${e.message}`, { error: e });
       this.exit(1);
     }
