@@ -41,6 +41,7 @@ const TaskLogs = ({ logs }: { logs: any[] }) => (
       .map(log => treeLogFormatter.transform(log)?.[Symbol.for("message")])
       .filter(m => m)
       .map((message, i) => (
+        // index-as-key is safe because logs are append-only
         <Box key={i}>
           {"🗒️ "} {message}
         </Box>
@@ -57,6 +58,7 @@ const TaskTree = ({
 }) => (
   <Box flexDirection="column">
     {tasks.map((task, i) => (
+      // index-as-key is safe because tasks are append-only
       <Box flexDirection="column" key={i}>
         <TaskHeader task={task} />
         <TaskLogs logs={logsByTask.get(task) || []} />
