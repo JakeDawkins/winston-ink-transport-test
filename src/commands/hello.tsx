@@ -1,110 +1,153 @@
 import { Command, flags } from "@oclif/command";
-import winston from "winston";
+import winston, { transports } from "winston";
 import logform from "logform";
 import Transport from "winston-transport";
 import React from "react";
-import { render, Color, Box, Text, Instance } from "ink";
+import ink, { Color, Box, Text } from "ink";
 import sleep from "sleep-promise";
 import Spinner from "ink-spinner";
 import colors from "colors/safe";
+import EventEmitter from "events";
+import StrictEventEmitter from "strict-event-emitter-types";
 
 const treeLogFormatter = winston.format.printf(info => info.message);
 
+const TaskHeader = ({ task }: { task: Task }) => (
+  <Box>
+    {
+      {
+        [TaskStatus.RUNNING]: (
+          <Color green>
+            <Spinner type="dots" />{" "}
+          </Color>
+        ),
+        [TaskStatus.SUCEEDED]: <Color green>{"✔ "}</Color>,
+        [TaskStatus.FAILED]: <Color red>{"✖️ "}</Color>,
+        [TaskStatus.PENDING]: <Color gray>{"… "}</Color>
+      }[task.status]
+    }
+    {task.title && <Text>{task.title}</Text>}
+  </Box>
+);
+
+const TaskLogs = ({ logs }: { logs: any[] }) => (
+  <Box flexDirection="column" marginLeft={2}>
+    {logs
+      .map(log => treeLogFormatter.transform(log)?.[Symbol.for("message")])
+      .filter(m => m)
+      .map((message, i) => (
+        <Box key={i}>
+          {"🗒️ "} {message}
+        </Box>
+      ))}
+  </Box>
+);
+
 const TaskTree = ({
-  task,
+  tasks,
   logsByTask
 }: {
-  task: Task | null;
+  tasks: readonly Task[];
   logsByTask: Map<Task, any[]>;
-}) => {
-  if (task == null) {
-    return <Box>Initializing...</Box>;
+}) => (
+  <Box flexDirection="column">
+    {tasks.map(task => (
+      <Box>
+        <TaskHeader task={task} />
+        <TaskLogs logs={logsByTask.get(task) || []} />
+        <Box marginLeft={2}>
+          <TaskTree tasks={task.subtasks} logsByTask={logsByTask} />
+        </Box>
+      </Box>
+    ))}
+  </Box>
+);
+
+interface TaskUI {
+  start(runner: TaskRunner): () => void;
+  winstonTransport(): Transport;
+}
+
+class InkTaskUI implements TaskUI {
+  private ink: ink.Instance | null = null;
+  private taskRunner: TaskRunner | null = null;
+  private readonly logsByTask = new Map<Task, any[]>();
+  start(taskRunner: TaskRunner) {
+    this.taskRunner = taskRunner;
+    this.ink = ink.render(this.rootComponent());
+    const rerender = this.rerender.bind(this);
+    taskRunner.emitter.on("statusChange", rerender);
+    taskRunner.emitter.on("titleChange", rerender);
+    return () => {
+      taskRunner.emitter.removeListener("statusChange", rerender);
+      taskRunner.emitter.removeListener("titleChange", rerender);
+      // XXX waitUntilExit?
+      this.ink.unmount();
+      this.taskRunner = null;
+      this.ink = null;
+    };
   }
-
-  const { title, status, subtasks, parent } = task;
-  // this is the root task -- it has no name/status that we care about
-  const isRoot = !parent;
-
-  const logs = logsByTask.get(task) || [];
-
-  return (
-    <Box flexDirection="column">
-      {/* don't render spinner/done/error for root task -- it's unimportant */}
-      {!isRoot && (
-        <Box>
-          {status === TaskStatus.RUNNING && (
-            <Color green>
-              <Spinner type="dots" />{" "}
-            </Color>
-          )}
-          {status === TaskStatus.SUCEEDED && <Color green>{"✔ "}</Color>}
-          {status === TaskStatus.FAILED && <Color red>{"✖️ "}</Color>}
-          {status === TaskStatus.PENDING && <Color gray>{"… "}</Color>}
-          {title && <Text>{title}</Text>}
-        </Box>
-      )}
-
-      {logs && logs.length ? (
-        <Box flexDirection="column" marginLeft={2}>
-          {logs
-            .map(
-              log => treeLogFormatter.transform(log)?.[Symbol.for("message")]
-            )
-            .filter(m => m)
-            .map((message, i) => (
-              <Box key={i}>
-                {"🗒️ "} {message}
-              </Box>
-            ))}
-        </Box>
-      ) : null}
-
-      {subtasks && subtasks.length ? (
-        <Box
-          flexDirection="column"
-          marginLeft={isRoot ? 0 : 2 /* don't indent top-level tasks*/}
-        >
-          {subtasks.map(subtask => (
-            <TaskTree
-              task={subtask}
-              key={Math.random()}
-              logsByTask={logsByTask}
-            />
-          ))}
-        </Box>
-      ) : null}
-    </Box>
-  );
-};
-
-class WinstonInkTransport extends Transport {
-  private ink: Instance;
-  private logsByTask = new Map<Task, any[]>();
-  constructor(opts: any) {
-    super(opts);
-    this.ink = render(<TaskTree task={null} logsByTask={this.logsByTask} />);
-  }
-
-  log(info: any, cb: any) {
-    if (info.task) {
-      if (!info.taskEvent) {
-        const task = info.task as Task;
-        if (!this.logsByTask.has(task)) {
-          this.logsByTask.set(task, []);
+  winstonTransport(): Transport {
+    return new Transport({
+      log: (info: any, next: () => void) => {
+        if (info.task) {
+          const task = info.task as Task;
+          if (!this.logsByTask.has(task)) {
+            this.logsByTask.set(task, []);
+          }
+          this.logsByTask.get(task)!.push(info);
+          this.rerender();
         }
-        this.logsByTask.get(task)!.push(info);
+        next();
       }
-      this.ink.rerender(
-        <TaskTree task={info.task.rootTask()} logsByTask={this.logsByTask} />
-      );
-    }
-    cb();
+    });
   }
-
-  unmount() {
-    this.ink.unmount();
+  private rerender() {
+    this.ink.rerender(this.rootComponent());
+  }
+  private rootComponent() {
+    return (
+      <TaskTree
+        // XXX eliminate rootTask?
+        tasks={this.taskRunner.rootTask.subtasks}
+        logsByTask={this.logsByTask}
+      />
+    );
   }
 }
+
+class LoggingTaskUI implements TaskUI {
+  constructor(private format: logform.Format) {}
+  private taskRunner: TaskRunner | null = null;
+  start(taskRunner: TaskRunner) {
+    this.taskRunner = taskRunner;
+    const onStatusChange = ({task, oldStatus,newStatus})=> 0;//XXX
+    const onTitleChange = ()=>0;
+    taskRunner.emitter.on("statusChange", onStatusChange);
+    taskRunner.emitter.on("titleChange", onTitleChange);
+    return () => {
+      taskRunner.emitter.removeListener("statusChange", onStatusChange);
+      taskRunner.emitter.removeListener("titleChange", onTitleChange);
+      this.taskRunner = null;
+    };
+  }
+  winstonTransport(): Transport {
+    return new winston.transports.Console({
+      format: this.format
+    });
+  }
+}
+
+// here's a bit of an XXX issue:
+//  - InkTaskTree wants a TaskRunner
+//  - TaskRunner wants a Logger
+//  - Logger wants a Transport
+//  - Transport wants an InkTaskTree
+// I think I break this by adding the transport later?
+// no actually I first make the InkTaskUI, then make a Logger from it, then make a TaskRunner from that
+
+// I think that LoggingTaskUI provides a transport and also converts statusChange/titleChange into extra log lines
+
 
 type TaskBody<T> = (t: Task) => Promise<T>;
 
@@ -121,12 +164,29 @@ interface TaskLogEventTitleChange {
   titleChange: { oldTitle: string; newTitle: string };
 }
 
-type TaskLogEvent = TaskLogEventStatusChange | TaskLogEventTitleChange;
+type TaskLogInfo = logform.TransformableInfo & {task:Task} &(TaskLogEventStatusChange | TaskLogEventTitleChange);
 
-type TaskLogInfo = logform.TransformableInfo & {
-  task: Task;
-  taskEvent?: TaskLogEvent;
-};
+interface TaskRunnerEvents {
+  statusChange: { task: Task; oldStatus?: TaskStatus; newStatus: TaskStatus };
+  titleChange: {
+    task: Task;
+    oldTitle: string;
+    newTitle: string;
+    logEntry: winston.LogEntry;
+  };
+}
+class TaskRunner {
+  public readonly rootTask: Task = new Task(this, null, null);
+  public readonly emitter: StrictEventEmitter<
+    EventEmitter,
+    TaskRunnerEvents
+  > = new EventEmitter();
+  constructor(public readonly logger: winston.Logger) {}
+
+  async run<T>(body: TaskBody<T>): Promise<T> {
+    return await this.rootTask.run(body);
+  }
+}
 
 class Task {
   public readonly logger: winston.Logger;
@@ -135,7 +195,7 @@ class Task {
   private _originalTitle: string | null;
   private _title: string | null;
   constructor(
-    logger: winston.Logger,
+    public readonly runner: TaskRunner,
     title: string | null,
     public readonly parent: Task | null
   ) {
@@ -150,7 +210,7 @@ class Task {
     }
     this._originalTitle = title;
     this._title = title;
-    this.logger = logger.child({
+    this.logger = runner.logger.child({
       task: this
     });
 
@@ -167,19 +227,17 @@ class Task {
   get title(): string | null {
     return this._title;
   }
+  // XXX update this comment
   // setTitle updates the title for Ink view, but not for the normal log view's path.
-  // For the normal log view, it logs logRecord instead.
-  setTitle(newTitle: string, logRecord: winston.LogEntry) {
+  // For the normal log view, it logs logEntry instead.
+  setTitle(newTitle: string, logEntry: winston.LogEntry) {
     const oldTitle = this._title;
     this._title = newTitle;
-    this.logger.log({
-      ...logRecord,
-      taskEvent: {
-        titleChange: {
-          newTitle,
-          oldTitle
-        }
-      }
+    this.runner.emitter.emit("titleChange", {
+      task: this,
+      newTitle,
+      oldTitle,
+      logEntry
     });
   }
   isRoot() {
@@ -199,15 +257,10 @@ class Task {
     const oldStatus = this._status;
     if (oldStatus !== newStatus) {
       this._status = newStatus;
-      this.logger.log({
-        level: "task",
-        message: "status-change",
-        taskEvent: {
-          statusChange: {
-            newStatus,
-            oldStatus
-          }
-        }
+      this.runner.emitter.emit("statusChange", {
+        task: this,
+        newStatus,
+        oldStatus
       });
     }
   }
@@ -227,7 +280,7 @@ class Task {
   }
 
   async task<U>(subTitle: string, subBody: TaskBody<U>) {
-    const subTask = new Task(this.logger, subTitle, this);
+    const subTask = new Task(this.runner, subTitle, this);
     return await subTask.run(subBody);
   }
 
@@ -236,17 +289,10 @@ class Task {
     pendingUntil: Promise<unknown>[],
     subBody: TaskBody<U>
   ) {
-    const subTask = new Task(this.logger, subTitle, this);
+    const subTask = new Task(this.runner, subTitle, this);
     await Promise.all(pendingUntil);
     return await subTask.run(subBody);
   }
-}
-
-async function runTasks<T>(
-  logger: winston.Logger,
-  body: TaskBody<T>
-): Promise<T> {
-  return await new Task(logger, null, null).run(body);
 }
 
 export default class Hello extends Command {
@@ -283,9 +329,19 @@ export default class Hello extends Command {
     };
 
     switch (flags.output) {
-      case "ink":
-        transport = new WinstonInkTransport({});
+      case "ink": {
+        const transport = new WinstonInkTransport({});
+        const logger = winston.createLogger({
+          transports: [transport],
+          // XXX one big problem with using Winston to update Ink is that if we set
+          //     the log level to something that blocks the metadata updates, Ink breaks???
+          //     maybe we just don't support setting log levels in ink mode.
+          level: "task",
+          levels: customLevels.levels
+        });
+
         break;
+      }
       case "logs":
       case "logs-monochrome": {
         const formats = [
