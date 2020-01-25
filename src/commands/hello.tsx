@@ -3,12 +3,11 @@ import winston, { transports } from "winston";
 import logform from "logform";
 import Transport from "winston-transport";
 import React from "react";
-import ink, { Color, Box, Text } from "ink";
+import{ Instance as InkInstance, render as inkRender, Color, Box, Text } from "ink";
 import sleep from "sleep-promise";
 import Spinner from "ink-spinner";
 import colors from "colors/safe";
-import EventEmitter from "events";
-import StrictEventEmitter from "strict-event-emitter-types";
+import Emittery from "emittery";
 
 const treeLogFormatter = winston.format.printf(info => info.message);
 
@@ -51,8 +50,8 @@ const TaskTree = ({
   logsByTask: Map<Task, any[]>;
 }) => (
   <Box flexDirection="column">
-    {tasks.map(task => (
-      <Box>
+    {tasks.map((task, i) => (
+      <Box flexDirection="column" key={i}>
         <TaskHeader task={task} />
         <TaskLogs logs={logsByTask.get(task) || []} />
         <Box marginLeft={2}>
@@ -69,20 +68,20 @@ interface TaskUI {
 }
 
 class InkTaskUI implements TaskUI {
-  private ink: ink.Instance | null = null;
+  private ink: InkInstance | null = null;
   private taskRunner: TaskRunner | null = null;
   private readonly logsByTask = new Map<Task, any[]>();
   start(taskRunner: TaskRunner) {
     this.taskRunner = taskRunner;
-    this.ink = ink.render(this.rootComponent());
-    const rerender = this.rerender.bind(this);
-    taskRunner.emitter.on("statusChange", rerender);
-    taskRunner.emitter.on("titleChange", rerender);
+    this.ink = inkRender(this.rootComponent());
+    const stoppers = [
+      taskRunner.emitter.on("statusChange", () => this.rerender()),
+      taskRunner.emitter.on("titleChange", () => this.rerender())
+    ];
     return () => {
-      taskRunner.emitter.removeListener("statusChange", rerender);
-      taskRunner.emitter.removeListener("titleChange", rerender);
+      stoppers.forEach(s => s());
       // XXX waitUntilExit?
-      this.ink.unmount();
+      this.ink!.unmount();
       this.taskRunner = null;
       this.ink = null;
     };
@@ -103,13 +102,14 @@ class InkTaskUI implements TaskUI {
     });
   }
   private rerender() {
-    this.ink.rerender(this.rootComponent());
+    this.ink!.rerender(this.rootComponent());
   }
   private rootComponent() {
     return (
       <TaskTree
         // XXX eliminate rootTask?
-        tasks={this.taskRunner.rootTask.subtasks}
+        // XXX eliminate all these bangs?
+        tasks={this.taskRunner!.rootTask.subtasks}
         logsByTask={this.logsByTask}
       />
     );
@@ -121,13 +121,22 @@ class LoggingTaskUI implements TaskUI {
   private taskRunner: TaskRunner | null = null;
   start(taskRunner: TaskRunner) {
     this.taskRunner = taskRunner;
-    const onStatusChange = ({task, oldStatus,newStatus})=> 0;//XXX
-    const onTitleChange = ()=>0;
-    taskRunner.emitter.on("statusChange", onStatusChange);
-    taskRunner.emitter.on("titleChange", onTitleChange);
+    const onTitleChange = () => 0;
+    const stoppers = [
+      taskRunner.emitter.on("statusChange", taskEvent => {
+        taskEvent.task.logger.log({
+          level: "task",
+          message: "statusChange",
+          taskEvent
+        });
+        // ...
+      }),
+      taskRunner.emitter.on("titleChange", ({ task, logEntry }) => {
+        task.logger.log(logEntry);
+      })
+    ];
     return () => {
-      taskRunner.emitter.removeListener("statusChange", onStatusChange);
-      taskRunner.emitter.removeListener("titleChange", onTitleChange);
+      stoppers.forEach(s => s());
       this.taskRunner = null;
     };
   }
@@ -148,7 +157,6 @@ class LoggingTaskUI implements TaskUI {
 
 // I think that LoggingTaskUI provides a transport and also converts statusChange/titleChange into extra log lines
 
-
 type TaskBody<T> = (t: Task) => Promise<T>;
 
 enum TaskStatus {
@@ -157,14 +165,17 @@ enum TaskStatus {
   SUCEEDED,
   FAILED
 }
+
+// XXX use this to define events
 interface TaskLogEventStatusChange {
-  statusChange: { oldStatus?: TaskStatus; newStatus: TaskStatus };
+  statusChange: { task: Task; oldStatus?: TaskStatus; newStatus: TaskStatus };
 }
 interface TaskLogEventTitleChange {
-  titleChange: { oldTitle: string; newTitle: string };
+  titleChange: { task: Task; oldTitle: string; newTitle: string };
 }
 
-type TaskLogInfo = logform.TransformableInfo & {task:Task} &(TaskLogEventStatusChange | TaskLogEventTitleChange);
+type TaskLogInfo = logform.TransformableInfo &
+  (TaskLogEventStatusChange | TaskLogEventTitleChange);
 
 interface TaskRunnerEvents {
   statusChange: { task: Task; oldStatus?: TaskStatus; newStatus: TaskStatus };
@@ -176,15 +187,19 @@ interface TaskRunnerEvents {
   };
 }
 class TaskRunner {
-  public readonly rootTask: Task = new Task(this, null, null);
-  public readonly emitter: StrictEventEmitter<
-    EventEmitter,
-    TaskRunnerEvents
-  > = new EventEmitter();
+  // XXX eliminating root task would be great because right now root task emits
+  // as soon as created, yuck
+  public readonly emitter = new Emittery.Typed<TaskRunnerEvents>();
+  public readonly rootTask = new Task(this, null, null);
   constructor(public readonly logger: winston.Logger) {}
 
-  async run<T>(body: TaskBody<T>): Promise<T> {
-    return await this.rootTask.run(body);
+  async run<T>(ui: TaskUI, body: TaskBody<T>): Promise<T> {
+    const stopUI = ui.start(this);
+    try {
+      return await this.rootTask.run(body);
+    } finally {
+      stopUI();
+    }
   }
 }
 
@@ -231,7 +246,7 @@ class Task {
   // setTitle updates the title for Ink view, but not for the normal log view's path.
   // For the normal log view, it logs logEntry instead.
   setTitle(newTitle: string, logEntry: winston.LogEntry) {
-    const oldTitle = this._title;
+    const oldTitle = this._title!;  // XXX ban root
     this._title = newTitle;
     this.runner.emitter.emit("titleChange", {
       task: this,
@@ -248,9 +263,6 @@ class Task {
       return [];
     }
     return [...this.parent.path(), this._originalTitle];
-  }
-  rootTask(): Task {
-    return this.parent === null ? this : this.parent.rootTask();
   }
 
   private setStatus(newStatus: TaskStatus) {
@@ -297,8 +309,6 @@ class Task {
 
 export default class Hello extends Command {
   static flags = {
-    name: flags.string({ char: "n", description: "name to print" }),
-    force: flags.boolean({ char: "f" }),
     output: flags.string({
       char: "o",
       default: "ink",
@@ -308,9 +318,7 @@ export default class Hello extends Command {
 
   async run() {
     const { flags } = this.parse(Hello);
-    const name = flags.name || "world";
 
-    let transport: Transport;
     const customLevels = {
       levels: {
         error: 0,
@@ -327,190 +335,185 @@ export default class Hello extends Command {
         debug: "blue"
       }
     };
+    winston.addColors(customLevels.colors);
 
-    switch (flags.output) {
-      case "ink": {
-        const transport = new WinstonInkTransport({});
-        const logger = winston.createLogger({
-          transports: [transport],
-          // XXX one big problem with using Winston to update Ink is that if we set
-          //     the log level to something that blocks the metadata updates, Ink breaks???
-          //     maybe we just don't support setting log levels in ink mode.
-          level: "task",
-          levels: customLevels.levels
-        });
+    let taskUI: TaskUI;
 
-        break;
-      }
-      case "logs":
-      case "logs-monochrome": {
-        const formats = [
-          winston.format(info => {
-            if (info.task instanceof Task) {
-              const event = info as TaskLogInfo;
-              if (event.task.isRoot()) {
-                return false;
-              }
-              let color: ((s: string) => string) | undefined;
-              if (event.taskEvent) {
-                if ("statusChange" in event.taskEvent) {
-                  switch (event.taskEvent.statusChange.newStatus) {
-                    case TaskStatus.RUNNING:
-                      color = colors.magenta;
-                      event.message = "Starting!";
-                      break;
-                    case TaskStatus.SUCEEDED:
-                      color = colors.green;
-                      event.message = "✔ Success!";
-                      break;
-                    case TaskStatus.FAILED:
-                      color = colors.red;
-                      event.message = "✖️ Failed!";
-                      break;
-                    case TaskStatus.PENDING:
-                      // Don't log anything for a pending task.
-                      return false;
-                    default:
-                      throw Error(`unknown end status ${event.task.status}`);
-                  }
-                }
-                // Don't specially handle title change: we expect title changes to come with a log record.
-              }
-              event.message = `[${event.task.path().join(" -> ")}] ${
-                event.message
-              }`;
-              if (color) {
-                event.message = color(event.message);
-              }
-            }
-            return info;
-          })(),
-          winston.format.cli({ levels: customLevels.levels })
-        ];
-        if (flags.output === "logs-monochrome") {
-          formats.push(winston.format.uncolorize());
-        }
-        transport = new winston.transports.Console({
-          format: winston.format.combine(...formats)
-        });
-        break;
-      }
-      case "json":
-      case "json-pretty":
-        transport = new winston.transports.Console({
-          format: winston.format.combine(
-            winston.format(info => {
-              if (info.task instanceof Task) {
-                info.task = info.task.path();
-              }
-              return info;
-            })(),
-            winston.format.json({
-              space: flags.output === "json-pretty" ? 2 : undefined
-            })
-          )
-        });
-        break;
-      default:
-        throw Error("invalid output format");
+    if (true) {
+      taskUI = new InkTaskUI();
     }
 
     const logger = winston.createLogger({
-      transports: [transport],
-      // XXX one big problem with using Winston to update Ink is that if we set
-      //     the log level to something that blocks the metadata updates, Ink breaks???
-      //     maybe we just don't support setting log levels in ink mode.
+      transports: [taskUI.winstonTransport()],
       level: "task",
       levels: customLevels.levels
     });
-    winston.addColors(customLevels.colors);
 
-    logger.info(`hello ${name} from ./src/commands/hello.ts`);
+    // switch (flags.output) {
+    //   case "ink": {
+    //     const transport = new WinstonInkTransport({});
+    //     const logger = winston.createLogger({
+    //       transports: [transport],
+    //       // XXX one big problem with using Winston to update Ink is that if we set
+    //       //     the log level to something that blocks the metadata updates, Ink breaks???
+    //       //     maybe we just don't support setting log levels in ink mode.
+    //       level: "task",
+    //       levels: customLevels.levels
+    //     });
 
-    if (flags.force) logger.warn(`The --force is with you, ${name}.`);
+    //     break;
+    //   }
+    //   case "logs":
+    //   case "logs-monochrome": {
+    //     const formats = [
+    //       winston.format(info => {
+    //         if (info.task instanceof Task) {
+    //           const event = info as TaskLogInfo;
+    //           if (event.task.isRoot()) {
+    //             return false;
+    //           }
+    //           let color: ((s: string) => string) | undefined;
+    //           if (event.taskEvent) {
+    //             if ("statusChange" in event.taskEvent) {
+    //               switch (event.taskEvent.statusChange.newStatus) {
+    //                 case TaskStatus.RUNNING:
+    //                   color = colors.magenta;
+    //                   event.message = "Starting!";
+    //                   break;
+    //                 case TaskStatus.SUCEEDED:
+    //                   color = colors.green;
+    //                   event.message = "✔ Success!";
+    //                   break;
+    //                 case TaskStatus.FAILED:
+    //                   color = colors.red;
+    //                   event.message = "✖️ Failed!";
+    //                   break;
+    //                 case TaskStatus.PENDING:
+    //                   // Don't log anything for a pending task.
+    //                   return false;
+    //                 default:
+    //                   throw Error(`unknown end status ${event.task.status}`);
+    //               }
+    //             }
+    //             // Don't specially handle title change: we expect title changes to come with a log record.
+    //           }
+    //           event.message = `[${event.task.path().join(" -> ")}] ${
+    //             event.message
+    //           }`;
+    //           if (color) {
+    //             event.message = color(event.message);
+    //           }
+    //         }
+    //         return info;
+    //       })(),
+    //       winston.format.cli({ levels: customLevels.levels })
+    //     ];
+    //     if (flags.output === "logs-monochrome") {
+    //       formats.push(winston.format.uncolorize());
+    //     }
+    //     transport = new winston.transports.Console({
+    //       format: winston.format.combine(...formats)
+    //     });
+    //     break;
+    //   }
+    //   case "json":
+    //   case "json-pretty":
+    //     transport = new winston.transports.Console({
+    //       format: winston.format.combine(
+    //         winston.format(info => {
+    //           if (info.task instanceof Task) {
+    //             info.task = info.task.path();
+    //           }
+    //           return info;
+    //         })(),
+    //         winston.format.json({
+    //           space: flags.output === "json-pretty" ? 2 : undefined
+    //         })
+    //       )
+    //     });
+    //     break;
+    //   default:
+    //     throw Error("invalid output format");
+    // }
+
+    const runner = new TaskRunner(logger);
 
     try {
-      try {
-        await runTasks(logger, async t => {
-          await t.task("A tree of tasks", async t => {
-            t.logger.info("If a task logs...");
-            t.logger.warn("... it shows up at the right spot in the tree");
-          });
-
-          await t.task("These run sequentially", async t => {
-            await t.task("... and can be nested", async t => {
-              await sleep(300);
-            });
-            await t.task("... like this!", async t => {
-              await sleep(500);
-              await t.task("So deep!", async t => {});
-            });
-          });
-
-          await t.task("Tasks can run in parallel", async t => {
-            await Promise.all([
-              t.task("And end in...", async t => {
-                t.logger.info("Waiting a while");
-                await sleep(5000);
-                t.logger.info("Done!");
-              }),
-              t.task("...either order", async t => {
-                t.logger.info("Waiting a bit");
-                await sleep(2000);
-                t.logger.info("Done!");
-              })
-            ]);
-          });
-
-          await t.task(
-            "Tasks can run sequentially with later tasks 'pending', and change their titles",
-            async t => {
-              function appendTitle<T>(t: Task, result: T): T {
-                t.setTitle(`${t.title}: ${result}!`, {
-                  level: "info",
-                  message: `Result is ${result}!`
-                });
-                return result;
-              }
-              const t1 = t.task("Calculate a number", async t => {
-                await sleep(2000);
-                return appendTitle(t, 123);
-              });
-              const t2 = t.pendingTask("Square it", [t1], async t => {
-                const t1Result = await t1;
-                await sleep(2000);
-                return appendTitle(t, t1Result * t1Result);
-              });
-              const t3 = t.pendingTask("Negate it", [t2], async t => {
-                const t2Result = await t2;
-                await sleep(2000);
-                return appendTitle(t, -t2Result);
-              });
-              await Promise.all([t1, t2, t3]);
-            }
-          );
-
-          await t.task("Tasks can fail...", async t => {
-            await t.task(
-              "... and they make their parents fail too.",
-              async t => {
-                t.logger.warn("I'm going to fail soon!");
-                await sleep(500);
-                throw new Error("oh no");
-              }
-            );
-          });
-
-          await t.task("This task never shows up", async t => {});
+      console.log("WHAT")
+      await runner.run(taskUI, async t => {
+        console.log("HI");
+        await t.task("A tree of tasks", async t => {
+          t.logger.info("If a task logs...");
+          t.logger.warn("... it shows up at the right spot in the tree");
         });
-      } finally {
-        if (transport instanceof WinstonInkTransport) {
-          transport.unmount();
-        }
-      }
+
+        await t.task("These run sequentially", async t => {
+          await t.task("... and can be nested", async t => {
+            await sleep(300);
+          });
+          await t.task("... like this!", async t => {
+            await sleep(500);
+            await t.task("So deep!", async t => {});
+          });
+        });
+
+        await t.task("Tasks can run in parallel", async t => {
+          await Promise.all([
+            t.task("And end in...", async t => {
+              t.logger.info("Waiting a while");
+              await sleep(5000);
+              t.logger.info("Done!");
+            }),
+            t.task("...either order", async t => {
+              t.logger.info("Waiting a bit");
+              await sleep(2000);
+              t.logger.info("Done!");
+            })
+          ]);
+        });
+
+        await t.task(
+          "Tasks can run sequentially with later tasks 'pending', and change their titles",
+          async t => {
+            function appendTitle<T>(t: Task, result: T): T {
+              t.setTitle(`${t.title}: ${result}!`, {
+                level: "info",
+                message: `Result is ${result}!`
+              });
+              return result;
+            }
+            const t1 = t.task("Calculate a number", async t => {
+              await sleep(2000);
+              return appendTitle(t, 123);
+            });
+            const t2 = t.pendingTask("Square it", [t1], async t => {
+              const t1Result = await t1;
+              await sleep(2000);
+              return appendTitle(t, t1Result * t1Result);
+            });
+            const t3 = t.pendingTask("Negate it", [t2], async t => {
+              const t2Result = await t2;
+              await sleep(2000);
+              return appendTitle(t, -t2Result);
+            });
+            await Promise.all([t1, t2, t3]);
+          }
+        );
+
+        await t.task("Tasks can fail...", async t => {
+          await t.task("... and they make their parents fail too.", async t => {
+            t.logger.warn("I'm going to fail soon!");
+            await sleep(500);
+            throw new Error("oh no");
+          });
+        });
+
+        await t.task("This task never shows up", async t => {});
+      });
     } catch (e) {
       // XXX currently this error isn't displaying in ink mode --- probably should move it before
       //     unmount and make sure that non-task logs show up somewhere?
+      console.log("yikes", e)
       logger.error(`Command failed: ${e.message}`, { error: e });
       this.exit(1);
     }
