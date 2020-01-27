@@ -1,5 +1,5 @@
 import { Command, flags } from "@oclif/command";
-import winston, { transports } from "winston";
+import winston from "winston";
 import logform from "logform";
 import Transport from "winston-transport";
 import React from "react";
@@ -17,6 +17,9 @@ import Emittery from "emittery";
 
 const treeLogFormatter = winston.format.printf(info => info.message);
 
+/**
+ * Just prints the title of the task, preceded by a check/x/...
+ */
 const TaskHeader = ({ task }: { task: Task }) => (
   <Box>
     {
@@ -35,6 +38,10 @@ const TaskHeader = ({ task }: { task: Task }) => (
   </Box>
 );
 
+/**
+ * if a task has logs associated with it, this prints them all, one at a time
+ * padded, formatted with a notepad emoji before each
+ */
 const TaskLogs = ({ logs }: { logs: any[] }) => (
   <Box flexDirection="column" marginLeft={2}>
     {logs
@@ -49,6 +56,9 @@ const TaskLogs = ({ logs }: { logs: any[] }) => (
   </Box>
 );
 
+/**
+ * renders out a task, its associated logs and subtasks (recursively)
+ */
 const TaskTree = ({
   tasks,
   logsByTask
@@ -70,22 +80,49 @@ const TaskTree = ({
   </Box>
 );
 
+/**
+ * interface for different UI patterns that winston can handle.
+ *
+ * - The `start` function returns a "cleanup" function that will be run once
+ *   the root task has complete (the command finishes).
+ * - The winstonTransport fn returns a Transport that can be used to log
+ *   events.
+ */
 interface TaskUI {
   start(runner: TaskRunner): () => void;
   winstonTransport(): Transport;
 }
 
+/**
+ * TaskUI implementation for rendering to the console using Ink (React)
+ */
 class InkTaskUI implements TaskUI {
   private ink: InkInstance | null = null;
   private taskRunner: TaskRunner | null = null;
   private readonly logsByTask = new Map<Task, any[]>();
+
+  /**
+   * sets up the react renderes which listens to emitter events to rerender
+   * the task tree
+   */
   start(taskRunner: TaskRunner) {
     this.taskRunner = taskRunner;
     this.ink = inkRender(this.rootComponent());
+    /* this is called stoppers, because emitter.on returns an "unsubscribe"
+     * functions. So the actual items in this list are unsubscribers to be
+     * called when when the "stop" fn is run.
+     */
     const stoppers = [
       taskRunner.emitter.on("statusChange", () => this.rerender()),
       taskRunner.emitter.on("titleChange", () => this.rerender())
     ];
+
+    /**
+     * Cleanup function:
+     * - unsubscribe from events
+     * - unmount react tree
+     * - reset all runners/logs
+     */
     return () => {
       stoppers.forEach(s => s());
       // XXX waitUntilExit?
@@ -95,6 +132,10 @@ class InkTaskUI implements TaskUI {
       this.logsByTask.clear();
     };
   }
+
+  /**
+   *
+   */
   winstonTransport(): Transport {
     return new Transport({
       log: (info: any, next: () => void) => {
